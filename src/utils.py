@@ -311,7 +311,7 @@ def add_microstructure_signals(
     )
 
     df = df.with_columns(
-        days_before = pl.business_day_count(
+        days_before=pl.business_day_count(
             pl.col("date").cast(pl.Date),
             pl.col("target_date").cast(pl.Date),
         )
