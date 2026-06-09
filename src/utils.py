@@ -310,6 +310,13 @@ def add_microstructure_signals(
         noi=pl.col("ofi") - pl.col("stv"),
     )
 
+    df = df.with_columns(
+        days_before = pl.business_day_count(
+            pl.col("date").cast(pl.Date),
+            pl.col("target_date").cast(pl.Date),
+        )
+    )
+    
     if drop_lag_nulls:
         df = df.drop_nulls(subset=SIGNAL_LAG_COLS)
 
