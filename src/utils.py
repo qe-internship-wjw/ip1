@@ -158,17 +158,16 @@ def add_roll_window(df: pl.DataFrame, target_col: str, roll_days: int = 10) -> p
     (weekends excluded) immediately *preceding* `target_col` — i.e. the target date itself
     is excluded. Rows with a null target get null windows.
     """
-    targets = df[target_col].to_numpy().astype("datetime64[D]")
-    valid = ~np.isnat(targets)
-
-    start = np.full(targets.shape, np.datetime64("NaT", "D"))
-    end = np.full(targets.shape, np.datetime64("NaT", "D"))
-    start[valid] = np.busday_offset(targets[valid], -roll_days, roll="backward")
-    end[valid] = np.busday_offset(targets[valid], -1, roll="backward")
-
     return df.with_columns(
-        pl.Series("roll_start", start).cast(pl.Date),
-        pl.Series("roll_end", end).cast(pl.Date),
+        pl.col(target_col)
+        .cast(pl.Date)
+        .dt.add_business_days(-roll_days, roll="backward")
+        .alias("roll_start"),
+        
+        pl.col(target_col)
+        .cast(pl.Date)
+        .dt.add_business_days(-1, roll="backward")
+        .alias("roll_end")
     )
 
 
