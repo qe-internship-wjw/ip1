@@ -303,6 +303,10 @@ def add_microstructure_signals(
     )
 
     df = df.with_columns(
+        delta_p_bp=pl.col('delta_p') * 10000 / pl.col('futures_price')
+    )
+
+    df = df.with_columns(
         ofi=pl.col("delta_lb") - pl.col("delta_la"),
         stv=pl.col("signed_volume").fill_null(0),  # no trades in a bin -> signed volume 0
     ).with_columns(
