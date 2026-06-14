@@ -41,6 +41,9 @@ BINNED_COLS = [
     'QCODE', 'SECURITY', 'BIN_START_TIME', 'PUBLICATION_DATE',
     'BID_SIZE_START', 'ASK_SIZE_START', 'BID_START', 'ASK_START',
     'VOLUME', 'SIGNED_VOLUME',
+    # HIGH / LOW of the bin: used by the VWAP hi-lo fill model (was the bin's price range
+    # deep enough to fill a resting limit?). Verify these match the BINNED_DATA column names.
+    'HIGH', 'LOW',
 ]
 QCODE_COLS = ['QCODE', 'BBG_CODE', 'YELLOW_KEY', 'DELIVERY', 'IS_CONVENTION_BUY_NEAR']
 SEC_META_COLS = ['SECURITY', 'LAST_TRADE_DATE', 'FIRST_NOTICE_DATE']
