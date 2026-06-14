@@ -487,6 +487,73 @@ def run_rolling_backtest(
     return pl.DataFrame(rows)
 
 
+# ── 6. Per-bin OOS predictions (for the VWAP overlay) ───────────────────────────────
+
+def predict_target_bins(
+    df_signals_tc_clean: pl.DataFrame,
+    windows: list[RollingWindow],
+    target_col: str = 'delta_p_fwd',
+    feature_cols: list[str] = TC_FEATURES,
+    min_train_rows: int = 500,
+    min_val_rows: int = 50,
+    verbose: bool = True,
+) -> pl.DataFrame | None:
+    """Walk-forward OOS predictions of the next bin's move, aligned to each TARGET bin.
+
+    For each window: fit on train, tune the threshold on val, then predict ``delta_p_fwd`` for
+    every test bin with non-null features. The prediction made at bin t is about bin t+1, so it
+    is shifted one step forward WITHIN each [security, date] session to land on the target bin it
+    describes (``pred``). This is exactly the information an executor has at the *start* of the
+    target bin (the previous bin's features are already known), so there is no look-ahead.
+
+    Returns one row per OOS target bin: ``security, date, bin_start_time, pred, pred_made,
+    window, threshold`` (``pred`` is null on each session's first bin). None if no window
+    produced predictions. Consumed by ``src.vwap.run_improved_vwap_backtest``.
+    """
+    import numpy as np
+
+    out = []
+    for w in windows:
+        try:
+            res, data, _ = fit_ordered_logit(df_signals_tc_clean, w, target_col, feature_cols)
+        except Exception as exc:
+            if verbose:
+                print(f'{w.label()}: SKIP ({type(exc).__name__}: {exc})')
+            continue
+
+        if len(data['train'][0]) < min_train_rows or len(data['val'][0]) < min_val_rows:
+            if verbose:
+                print(f'{w.label()}: SKIP (thin train/val)')
+            continue
+
+        thr, _ = tune_threshold(*data['val'])
+
+        # Predict on ALL test bins with present features (do not require a non-null forward
+        # target, so the last bin of each session is still scored), keeping the row keys.
+        test = (
+            df_signals_tc_clean
+            .filter(pl.col('date').is_between(pl.lit(w.test_start), pl.lit(w.test_end), closed='both'))
+            .select([*feature_cols, 'security', 'date', 'bin_start_time'])
+            .drop_nulls(feature_cols)
+            .sort(['security', 'date', 'bin_start_time'])
+        )
+        if test.height == 0:
+            continue
+
+        probs = np.asarray(res.predict(exog=test.select(feature_cols).to_pandas()))
+        pred_made = assign_classes(probs, thr)
+        test = test.with_columns(pred_made=pl.Series('pred_made', pred_made)).with_columns(
+            pred=pl.col('pred_made').shift(1).over(['security', 'date']),
+            window=pl.lit(w.index),
+            threshold=pl.lit(float(thr)),
+        )
+        out.append(test.select('security', 'date', 'bin_start_time', 'pred', 'pred_made', 'window', 'threshold'))
+        if verbose:
+            print(f'{w.label()}: thr={thr:.3f}  test bins={test.height:,}')
+
+    return pl.concat(out) if out else None
+
+
 # ── Top-level entry point ───────────────────────────────────────────────────────────
 
 def build_backtest_inputs(
