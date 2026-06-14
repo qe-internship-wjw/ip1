@@ -38,7 +38,7 @@ Inputs are produced by ``src.pipeline``; pull the full history first, e.g.
 
     from src.pipeline import build_datasets, generate_signals
     df_cs, _ = build_datasets(env_path='../.env', years=list(range(2016, 2026)))
-    df_signals = generate_signals(df_cs, train_years=list(range(2016, 2020)))
+    df_signals = generate_signals(df_cs, normalization='time_of_roll')  # leakage-free scaling
 """
 
 from __future__ import annotations
@@ -375,10 +375,10 @@ def fit_ordered_logit(
 
     The ±2 minority class weight is the train inverse-frequency relative to the 0 class,
     computed on THIS window's train slice only — deriving it from the full sample (or from
-    val/test) would leak class balance into a training hyperparameter. (Note: the rolling
-    z-score imputation inside ``generate_signals`` still uses a global train mean for
-    degenerate-variance sessions; align its ``train_years`` with the earliest window, or
-    regenerate signals per window, if that second-order effect matters.)
+    val/test) would leak class balance into a training hyperparameter. The feature
+    normalisation is likewise leakage-free: ``generate_signals(normalization='time_of_roll')``
+    scales each signal by a volatility profiled from strictly prior rolls, so signals can be
+    generated once over the full history and sliced per window without contamination.
     """
     WeightedOrderedModel = _make_weighted_ordered_model()
 
@@ -505,12 +505,10 @@ def build_backtest_inputs(
     from src.pipeline import build_datasets, generate_signals
 
     years = list(range(data_start_year, data_end_year + 1))
-    # The first walk-forward train window is the earliest `TRAIN_MONTHS`; align the z-score
-    # imputation mean to it (its only train dependence — see fit_ordered_logit note).
-    train_years = list(range(data_start_year, data_start_year + TRAIN_MONTHS // 12))
-
     df_cs, _ = build_datasets(env_path=env_path, session=session, years=years)
-    df_signals = generate_signals(df_cs, train_years=train_years)
+    # 'time_of_roll' normalisation profiles each signal's volatility from PRIOR rolls only, so
+    # it needs no `train_years` and leaks nothing across the walk-forward splits.
+    df_signals = generate_signals(df_cs, normalization='time_of_roll')
 
     _, df_signals_tc = split_tick_constrained(df_signals)
     df_signals_tc_clean = clean_delta_p_tc(df_signals_tc)

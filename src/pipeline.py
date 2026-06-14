@@ -230,35 +230,32 @@ def apply_roll_volume_filter(
 
 # ── 5. Signal generation + normalisation ───────────────────────────────────────
 
-def generate_signals(
-    df_cs: pl.DataFrame,
-    train_years: list[int] = TRAIN_YEARS,
-    roll_win: int = ROLL_WIN,
-) -> pl.DataFrame:
-    """Microstructure signals (partitioned by SESSION [security, date]) + normalisation.
+# Flow signals carried as z-score-able / vol-scalable quantities (the others - delta_p and
+# obi - get their own scale normalisation in the transform stage).
+SIGNAL_NORM_COLS = ['ofi', 'stv', 'noi']
 
-    Normalised values overwrite the raw columns so downstream sections (H1, H2, H3)
-    use normalised signals automatically:
+# Time-of-roll volatility: a 1-hour centred window on 5-minute bins.
+TOR_VOL_WIN = 12
+TOR_VOL_MIN_SAMPLES = 6
 
-      1. delta_p in ticks (per-BBG_CODE tick size, kept as `_tick`),
-      2. OBI as fraction of total quoted size at the touch,
-      3. STV as signed square root, then rolling z-score within session,
-      4. OFI as rolling z-score within session,
-      5. NOI as signed square root, then rolling z-score within session.
 
-    LEAKAGE FIX: degenerate (near-zero) rolling stds are imputed with a typical std whose
-    mean is computed over TRAIN ROWS ONLY (`train_years`) - an un-grouped mean across all
-    years would let validation/test variance bleed into the normalisation of train rows
-    (and vice versa). The padded rows themselves may sit in any split; only the *mean*
-    is restricted.
+def _apply_signal_transforms(df_cs: pl.DataFrame) -> pl.DataFrame:
+    """Microstructure signals + the *scale* transforms that are independent of any split.
 
-    fill_nan(None) converts floating-point 0/0 = NaN to null for inactive bins rather
-    than propagating NaN into the regression.
+    Produces (all overwriting the raw columns):
+      - delta_p : in ticks (per-BBG_CODE tick size, kept as `_tick`),
+      - obi     : fraction of total quoted size at the touch,
+      - stv/noi : signed square root (variance-stabilising, sign-preserving),
+      - ofi     : left RAW here (its location/scale normalisation happens downstream).
+
+    No within-session rolling statistics and no train-restricted means are computed here, so
+    this stage is identical for every normalisation strategy. ``fill_nan(None)`` converts
+    floating-point 0/0 = NaN for inactive bins to null rather than propagating NaN.
     """
     df_signals = add_microstructure_signals(df_cs, security_col='security', time_col='bin_start_time')
 
-    # 1. Tick size per BBG_CODE: minimum strictly-positive |delta_p|
-    # (filter out zero and near-zero price changes to avoid noise/tick size confusion).
+    # Tick size per BBG_CODE: minimum strictly-positive |delta_p| (drop zero / near-zero
+    # changes so noise is not mistaken for the tick).
     tick_sizes = (
         df_signals
         .filter(pl.col('delta_p').abs() > 10e-6)
@@ -267,22 +264,32 @@ def generate_signals(
     )
     df_signals = df_signals.join(tick_sizes, on='bbg_code', how='left')
 
-    # Pre-compute rolling OFI mean and std within each session.
-    # df_signals is already sorted by [security, date, bin_start_time].
-    df_signals = df_signals.with_columns(
-        _ofi_mu=pl.col('ofi').rolling_mean(window_size=roll_win, min_samples=2).over(SESSION),
-        _ofi_sd=pl.col('ofi').rolling_std(window_size=roll_win, min_samples=2).over(SESSION),
-    )
-
-    # All five expressions are evaluated against the INPUT state of df_signals in this
-    # single with_columns call - Polars never sees intermediate results within the same
-    # call. This means pl.col('ofi') in the NOI denominator is the PRE-Z-SCORE raw OFI.
-    df_signals = df_signals.with_columns(
+    return df_signals.with_columns(
         delta_p=(pl.col('delta_p') / pl.col('_tick')).fill_nan(None),
         obi=(pl.col('obi') / (pl.col('bid_size_start') + pl.col('ask_size_start'))).fill_nan(None),
         stv=(pl.col('stv').cast(pl.Float64).abs().sqrt() * pl.col('stv').sign()).fill_nan(None),
-        ofi=((pl.col('ofi') - pl.col('_ofi_mu')) / pl.col('_ofi_sd')).fill_nan(None),
         noi=(pl.col('noi').cast(pl.Float64).abs().sqrt() * pl.col('noi').sign()).fill_nan(None),
+    )
+
+
+def _normalize_rolling_zscore(
+    df_signals: pl.DataFrame,
+    train_years: list[int],
+    roll_win: int,
+) -> pl.DataFrame:
+    """Original normalisation: rolling z-score of OFI / STV / NOI within each [security, date]
+    session.
+
+    LEAKAGE NOTE: degenerate (near-zero) STV/NOI rolling stds are imputed with a typical std
+    whose mean is taken over TRAIN ROWS ONLY (`train_years`). This fallback still references a
+    train partition (the motivation for the time-of-roll alternative below) and the rolling std
+    is noisy at the start of each session where the window has few samples.
+    """
+    df_signals = df_signals.with_columns(
+        _ofi_mu=pl.col('ofi').rolling_mean(window_size=roll_win, min_samples=2).over(SESSION),
+        _ofi_sd=pl.col('ofi').rolling_std(window_size=roll_win, min_samples=2).over(SESSION),
+    ).with_columns(
+        ofi=((pl.col('ofi') - pl.col('_ofi_mu')) / pl.col('_ofi_sd')).fill_nan(None),
     ).drop(['_ofi_mu', '_ofi_sd'])
 
     df_signals = df_signals.with_columns(
@@ -292,7 +299,6 @@ def generate_signals(
         _noi_sd=pl.col('noi').rolling_std(window_size=roll_win, min_samples=2).over(SESSION),
     )
 
-    # Impute degenerate (near-zero) rolling stds with a typical std from TRAIN rows only.
     _is_train = pl.col('date').dt.year().is_in(train_years)
     df_signals = df_signals.with_columns(
         _stv_sd=pl.when(pl.col('_stv_sd') < 1e-6)
@@ -303,11 +309,108 @@ def generate_signals(
                 .otherwise(pl.col('_noi_sd')),
     )
 
-    # STV and NOI as rolling z-scores within session.
     return df_signals.with_columns(
         stv=((pl.col('stv') - pl.col('_stv_mu')) / pl.col('_stv_sd')),
         noi=((pl.col('noi') - pl.col('_noi_mu')) / pl.col('_noi_sd')),
     ).drop(['_stv_mu', '_stv_sd', '_noi_mu', '_noi_sd'])
+
+
+def _normalize_time_of_roll(
+    df_signals: pl.DataFrame,
+    signal_cols: list[str] = SIGNAL_NORM_COLS,
+    vol_win: int = TOR_VOL_WIN,
+    min_samples: int = TOR_VOL_MIN_SAMPLES,
+    qcode_col: str = 'qcode',
+) -> pl.DataFrame:
+    """Time-of-roll volatility normalisation (leakage-free, no start-of-session noise blow-up).
+
+    Each signal is divided by a volatility that depends only on the *stage of the roll*
+    - (`days_until`, `bin_start_time`) - estimated from PAST rolls of the same ``qcode``:
+
+      1. Local intraday vol: within each [security, date] session, the centred `vol_win`-bin
+         (1-hour) rolling std of the signal. Centring uses neighbouring bins of the *same*
+         completed roll, so it is look-ahead only within already-historical rolls.
+      2. Time-of-roll profile: for each (qcode, days_until, bin_start_time) stage, the mean of
+         that local vol across all STRICTLY PRIOR rolls (securities ordered by `target_date`,
+         current roll excluded). A roll is normalised purely by rolls that finished before it,
+         so there is no train/val/test leakage and no train-restricted fallback.
+      3. Normalise: signal / profile-vol (scale only - the flow signals are ~zero-mean).
+
+    The earliest roll of each ``qcode`` (no prior history) and stages with a degenerate profile
+    vol yield null - dropped downstream rather than imputed, by design.
+    """
+    df = df_signals.sort(['security', 'date', 'bin_start_time'])
+
+    # 1. Local centred intraday vol per signal, never crossing a day boundary.
+    df = df.with_columns([
+        pl.col(c)
+        .rolling_std(window_size=vol_win, min_samples=min_samples, center=True)
+        .over(SESSION)
+        .alias(f'_locvol_{c}')
+        for c in signal_cols
+    ])
+
+    # 2. Expanding mean of local vol over prior rolls within each (qcode, stage) cell. Each
+    # security appears once per stage and rolls have distinct target_dates, so the cumulative
+    # sum/count ordered by target_date (current row excluded) is exactly the past-rolls mean.
+    stage = [qcode_col, 'days_until', 'bin_start_time']
+    df = df.sort([*stage, 'target_date', 'security'])
+    tor_exprs = []
+    for c in signal_cols:
+        lv = pl.col(f'_locvol_{c}')
+        present = lv.is_not_null().cast(pl.Int64)
+        prior_sum = lv.fill_null(0).cum_sum().over(stage) - lv.fill_null(0)
+        prior_cnt = present.cum_sum().over(stage) - present
+        # Guard prior_cnt == 0 explicitly: 0/0 would yield NaN (not null), which then slips
+        # past the > 1e-12 scale guard below. No prior roll -> no profile -> null.
+        tor_exprs.append(
+            pl.when(prior_cnt > 0).then(prior_sum / prior_cnt).otherwise(None).alias(f'_torvol_{c}')
+        )
+    df = df.with_columns(tor_exprs)
+
+    # 3. Scale-normalise; guard against a degenerate (≈0) profile vol producing inf.
+    df = df.with_columns([
+        pl.when(pl.col(f'_torvol_{c}') > 1e-12)
+        .then(pl.col(c) / pl.col(f'_torvol_{c}'))
+        .otherwise(None)
+        .alias(c)
+        for c in signal_cols
+    ])
+
+    drop = [f'_locvol_{c}' for c in signal_cols] + [f'_torvol_{c}' for c in signal_cols]
+    return df.drop(drop).sort(['security', 'date', 'bin_start_time'])
+
+
+def generate_signals(
+    df_cs: pl.DataFrame,
+    train_years: list[int] = TRAIN_YEARS,
+    roll_win: int = ROLL_WIN,
+    normalization: str = 'rolling_zscore',
+) -> pl.DataFrame:
+    """Microstructure signals (partitioned by SESSION [security, date]) + normalisation.
+
+    Normalised values overwrite the raw columns so downstream sections use them automatically:
+
+      1. delta_p in ticks (per-BBG_CODE tick size, kept as `_tick`),
+      2. OBI as fraction of total quoted size at the touch,
+      3-5. OFI / STV / NOI scaled by the chosen `normalization` (STV & NOI signed-sqrt first).
+
+    `normalization` selects the scale applied to OFI / STV / NOI:
+      - 'rolling_zscore' (default): within-session rolling z-score - the original method; see
+        ``_normalize_rolling_zscore`` (train-restricted std fallback, noisy at session start).
+      - 'time_of_roll': divide by a volatility profiled by roll stage from prior rolls only;
+        see ``_normalize_time_of_roll`` (leakage-free, no start-of-session blow-up). Requires
+        `qcode`, `days_until` and `target_date` columns (present on the spread frame).
+    """
+    df_signals = _apply_signal_transforms(df_cs)
+
+    if normalization == 'rolling_zscore':
+        return _normalize_rolling_zscore(df_signals, train_years, roll_win)
+    if normalization == 'time_of_roll':
+        return _normalize_time_of_roll(df_signals)
+    raise ValueError(
+        f"normalization must be 'rolling_zscore' or 'time_of_roll', got {normalization!r}"
+    )
 
 
 # ── Top-level entry point ───────────────────────────────────────────────────────
