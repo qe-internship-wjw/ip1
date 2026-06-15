@@ -13,6 +13,14 @@ Two independent pieces, both importable:
         compute_volume_curve, historical_volume_curve,    # VWAP volume profiles
     )
 
+It also hosts the fixed-split model/threshold/reporting helpers shared with notebook
+``02b_regressions_tc.ipynb`` (kept here, not duplicated in the notebook, to avoid drift):
+
+    from src.backtest import (
+        fit_weighted_olr, tune_thresholds, assign_classes,   # fit + per-tail F-beta thresholds
+        pr_threshold_df, report_all_splits, confusion_tile,  # validation/test reporting
+    )
+
 1. Walk-forward splits
    ``generate_rolling_windows`` emits a sequence of (train, val, test) date ranges:
      - train   : 4 years   (sliding, fixed length; first window starts 2016-01-01)
@@ -69,6 +77,11 @@ TICK_CONSTRAINED_BBG = ['OE', 'XP', 'DU', 'IK', 'RX', 'QZ', 'FV', 'TU', 'VG', 'U
 # makes the three collinear — see Research Plan §5.2).
 CATS = [-2, 0, 2]
 TC_FEATURES = ['obi', 'noi', 'stv']
+
+# Default F-beta for tail-threshold tuning. beta < 1 weights PRECISION above recall — the
+# execution use-case cares more about a tail signal being right than about catching every tail.
+# Override per call (e.g. beta=1.0, 2.0) for the backtest ablation studies.
+DEFAULT_BETA = 0.5
 
 
 # ── 1. Walk-forward window generation ─────────────────────────────────────────────
@@ -340,26 +353,50 @@ def _date_slice(
     return pdf
 
 
-def assign_classes(probs: np.ndarray, thr: float) -> np.ndarray:
-    """Tail-vs-majority decision rule: +2 if P(+2) >= thr, else -2 if P(-2) >= thr, else 0.
-    ``probs`` columns are ordered as CATS = [-2, 0, +2]."""
-    return np.where(probs[:, 2] >= thr, 2, np.where(probs[:, 0] >= thr, -2, 0))
+def assign_classes(probs: np.ndarray, thr_down: float, thr_up: float) -> np.ndarray:
+    """Tail decision rule with INDEPENDENT per-tail thresholds: predict +2 where P(+2) >= `thr_up`
+    and -2 where P(-2) >= `thr_down`, else 0. When both tails fire on the same row the more
+    probable tail wins (so the two thresholds need not be jointly calibrated). ``probs`` columns
+    are ordered as CATS = [-2, 0, +2]."""
+    p_down, p_up = probs[:, 0], probs[:, 2]
+    up_fires, down_fires = p_up >= thr_up, p_down >= thr_down
+    take_up = up_fires & (~down_fires | (p_up >= p_down))
+    take_down = down_fires & (~up_fires | (p_down > p_up))
+    return np.where(take_up, 2, np.where(take_down, -2, 0))
 
 
-def tune_threshold(y_val: np.ndarray, probs_val: np.ndarray, grid: np.ndarray | None = None):
-    """Choose the single decision threshold maximising macro-F1 over {-2, 0, +2} on the
-    VALIDATION set. Returns (best_thr, best_macro_f1)."""
-    from sklearn.metrics import f1_score
+def tune_thresholds(
+    y_val: np.ndarray,
+    probs_val: np.ndarray,
+    beta: float = DEFAULT_BETA,
+    grid: np.ndarray | None = None,
+):
+    """Choose the -2 and +2 decision thresholds INDEPENDENTLY on the VALIDATION set, each
+    maximising that tail's one-vs-rest F-beta. ``beta`` trades precision (beta<1) against recall
+    (beta>1) — see ``DEFAULT_BETA`` — and is the knob varied across the backtest ablations.
+
+    Tuning each tail one-vs-rest (P(tail) >= thr) decouples the two thresholds; the final
+    multiclass assignment in ``assign_classes`` then resolves the rare both-fire row by
+    probability. Returns ``(thr_down, thr_up, fbeta_down, fbeta_up)``.
+    """
+    from sklearn.metrics import fbeta_score
 
     if grid is None:
         grid = np.round(np.linspace(0.10, 0.95, 171), 4)
-    best_thr, best_f1 = float(grid[0]), -1.0
-    for thr in grid:
-        f1 = f1_score(y_val, assign_classes(probs_val, thr),
-                      labels=CATS, average='macro', zero_division=0)
-        if f1 > best_f1:
-            best_thr, best_f1 = float(thr), float(f1)
-    return best_thr, best_f1
+
+    def _best_tail(col: int, cls: int):
+        y_bin = (y_val == cls).astype(int)
+        best_thr, best_f = float(grid[0]), -1.0
+        for thr in grid:
+            f = fbeta_score(y_bin, (probs_val[:, col] >= thr).astype(int),
+                            beta=beta, zero_division=0)
+            if f > best_f:
+                best_thr, best_f = float(thr), float(f)
+        return best_thr, best_f
+
+    thr_down, fbeta_down = _best_tail(0, -2)
+    thr_up, fbeta_up = _best_tail(2, 2)
+    return thr_down, thr_up, fbeta_down, fbeta_up
 
 
 def fit_ordered_logit(
@@ -410,6 +447,152 @@ def fit_ordered_logit(
     return res, out, class_weight
 
 
+# ── 4b. Fixed-split helpers (used by notebook 02b_regressions_tc) ───────────────────
+#
+# The notebook reports the single fixed 2021-23 / 2024 / 2025 split (rather than the
+# walk-forward windows above). These helpers live here — not duplicated in the notebook — so
+# the model definition, threshold tuning and reporting cannot drift between the two. They share
+# ``assign_classes`` / ``tune_thresholds`` with the walk-forward driver.
+
+
+def _year_slice(
+    df: pl.DataFrame,
+    target_col: str,
+    feature_cols: list[str],
+    years: list[int],
+) -> pd.DataFrame:
+    """Materialise the rows whose trading-date year is in `years` to pandas, carrying the target,
+    the features and a ``cluster`` key = security|date. Mirrors ``_date_slice`` but selects by
+    calendar year (the notebook's chronological split)."""
+    pdf = (
+        df
+        .filter(pl.col('date').dt.year().is_in(years))
+        .select([target_col, *feature_cols, 'security', 'date'])
+        .drop_nulls()
+        .to_pandas()
+    )
+    pdf['cluster'] = pdf['security'].astype(str) + '|' + pdf['date'].astype(str)
+    return pdf
+
+
+def fit_weighted_olr(
+    df: pl.DataFrame,
+    target_col: str,
+    feature_cols: list[str],
+    train_years: list[int],
+    val_years: list[int],
+    test_years: list[int],
+    label: str | None = None,
+    verbose: bool = True,
+):
+    """Fit the class-weighted ordered logit on TRAIN `train_years` with cluster-robust SE
+    (clustered on the [security, date] session), then predict class probabilities for each split.
+
+    Returns ``(result, {split: (y_int, probs)})``. The ±2 minority class weight is the train
+    inverse-frequency relative to the 0 class, computed on the train years ONLY (deriving it from
+    val/test would leak class balance into a training hyperparameter). With ``verbose`` the model
+    summary and train class counts are printed.
+    """
+    WeightedOrderedModel = _make_weighted_ordered_model()
+
+    tr = _year_slice(df, target_col, feature_cols, train_years)
+    y_tr = tr[target_col].astype(int).values
+
+    counts = pd.Series(y_tr).value_counts()
+    n0, n_pos = counts.get(0, 0), counts.get(2, 0)
+    class_weight = (n0 / n_pos) if n_pos else 1.0
+    weights = np.where(y_tr == 0, 1.0, class_weight)
+
+    endog = pd.Categorical(y_tr, categories=CATS, ordered=True)
+    res = WeightedOrderedModel(endog, tr[feature_cols], obs_weights=weights, distr='logit').fit(
+        method='bfgs', cov_type='cluster', cov_kwds={'groups': tr['cluster'].values}, disp=False,
+    )
+
+    if verbose:
+        lbl = label or target_col
+        print(f'=== {lbl}:  {target_col} ~ {" + ".join(feature_cols)}  '
+              f'(train n={len(tr):,}, clusters={tr["cluster"].nunique():,}, '
+              f'class_weight on ±2 = {class_weight:.1f}x) ===')
+        print('train class counts:', dict(pd.Series(y_tr).value_counts().reindex(CATS).items()))
+        print(res.summary())
+
+    out = {}
+    for name, yrs in (('train', train_years), ('val', val_years), ('test', test_years)):
+        fr = _year_slice(df, target_col, feature_cols, yrs)
+        y = fr[target_col].astype(int).values
+        probs = np.asarray(res.predict(exog=fr[feature_cols])) if len(fr) else np.empty((0, 3))
+        out[name] = (y, probs)
+    return res, out
+
+
+def pr_threshold_df(y_val: np.ndarray, probs_val: np.ndarray) -> pd.DataFrame:
+    """Tidy precision/recall-vs-threshold for the two tail classes (long form), for plotting the
+    validation threshold sweep that ``tune_thresholds`` optimises over."""
+    from sklearn.metrics import precision_recall_curve
+
+    frames = []
+    for cls, col in ((-2, 0), (2, 2)):
+        prec, rec, thr = precision_recall_curve((y_val == cls).astype(int), probs_val[:, col])
+        frames.append(pd.DataFrame({
+            'Threshold': thr, 'Precision': prec[:-1], 'Recall': rec[:-1], 'Class': f'Class {cls:+d}',
+        }))
+    return pd.concat(frames, ignore_index=True).melt(
+        id_vars=['Threshold', 'Class'], value_vars=['Precision', 'Recall'],
+        var_name='Metric', value_name='Value',
+    )
+
+
+def report_all_splits(
+    data: dict,
+    thr_down: float,
+    thr_up: float,
+    label: str,
+    split_labels: dict | None = None,
+):
+    """Print per-split classification reports (precision / recall / F1 / support) at the tuned
+    ``(thr_down, thr_up)`` tail thresholds. ``split_labels`` maps split name -> display string
+    (e.g. {'train': '2021-2023', ...}); the raw name is used if omitted."""
+    from sklearn.metrics import classification_report
+
+    for name in ('train', 'val', 'test'):
+        y, probs = data[name]
+        pred = assign_classes(probs, thr_down, thr_up)
+        disp = (split_labels or {}).get(name, name)
+        print(f'\n--- {label} | {name} ({disp}) | thr=(-2:{thr_down:.3f}, +2:{thr_up:.3f}) | '
+              f'accuracy={(pred == y).mean():.4f} | n={len(y):,} ---')
+        print(classification_report(y, pred, labels=CATS,
+                                    target_names=['-2', '0', '+2'], zero_division=0))
+
+
+def confusion_tile(y_true: np.ndarray, y_pred: np.ndarray, title: str):
+    """plotnine confusion-matrix heatmap with raw counts and row percentages."""
+    from plotnine import (
+        ggplot, aes, geom_tile, geom_text, scale_fill_gradient, labs, theme_bw, theme,
+    )
+    from sklearn.metrics import confusion_matrix
+
+    cm = confusion_matrix(y_true, y_pred, labels=CATS)
+    cm_long = (
+        pd.DataFrame(cm, index=CATS, columns=CATS)
+        .rename_axis('Actual').reset_index()
+        .melt(id_vars='Actual', var_name='Predicted', value_name='n')
+        .assign(
+            row_pct=lambda d: 100 * d['n'] / d.groupby('Actual')['n'].transform('sum'),
+            label=lambda d: d.apply(lambda r: f"{int(r['n'])}\n({r['row_pct']:.1f}%)", axis=1),
+        )
+    )
+    for col, order in [('Predicted', ['-2', '0', '2']), ('Actual', ['2', '0', '-2'])]:
+        cm_long[col] = pd.Categorical(cm_long[col].astype(str), categories=order)
+    return (
+        ggplot(cm_long, aes(x='Predicted', y='Actual', fill='row_pct'))
+        + geom_tile(color='white', size=0.5)
+        + geom_text(aes(label='label'), size=9)
+        + scale_fill_gradient(low='#f0f4ff', high='#2166ac', name='Row %')
+        + labs(title=title, x='Predicted ΔP', y='Actual ΔP')
+        + theme_bw(base_size=11) + theme(figure_size=(5, 4))
+    )
+
+
 # ── 5. Walk-forward driver ──────────────────────────────────────────────────────────
 
 def run_rolling_backtest(
@@ -417,22 +600,25 @@ def run_rolling_backtest(
     windows: list[RollingWindow],
     target_col: str = 'delta_p_fwd',
     feature_cols: list[str] = TC_FEATURES,
+    beta: float = DEFAULT_BETA,
     min_train_rows: int = 500,
     min_test_rows: int = 50,
     verbose: bool = True,
 ) -> pl.DataFrame:
     """Run the predictive ordered logit walk-forward across `windows` and collect OOS metrics.
 
-    For each window: fit on train, tune the macro-F1 threshold on val, then score test at that
-    threshold. Windows whose train/test slices are too small (early history may lack
+    For each window: fit on train, tune the -2 and +2 thresholds INDEPENDENTLY on val (each
+    maximising its tail's F-beta — see ``tune_thresholds`` / ``beta``), then score test at those
+    thresholds. Windows whose train/test slices are too small (early history may lack
     tick-constrained data) are skipped with a logged reason rather than erroring, so the whole
     walk-forward never aborts on a thin window.
 
-    Returns one row per attempted window: the window bounds, fitted class weight, tuned
-    threshold, validation macro-F1, and test accuracy / macro-F1 / per-class support, plus a
-    `status` column ('ok' or the skip reason).
+    Returns one row per attempted window: the window bounds, fitted class weight, the two tuned
+    tail thresholds, per-tail validation F-beta, and test accuracy / macro-F-beta / per-class
+    support, plus a `status` column ('ok' or the skip reason). `beta` is recorded so ablation
+    sweeps over beta stay self-describing.
     """
-    from sklearn.metrics import f1_score
+    from sklearn.metrics import fbeta_score
 
     rows = []
     for w in windows:
@@ -457,31 +643,35 @@ def run_rolling_backtest(
             continue
 
         y_val, probs_val = data['val']
-        thr, val_f1 = tune_threshold(y_val, probs_val)
+        thr_down, thr_up, val_fb_down, val_fb_up = tune_thresholds(y_val, probs_val, beta=beta)
 
         y_test, probs_test = data['test']
-        pred_test = assign_classes(probs_test, thr)
+        pred_test = assign_classes(probs_test, thr_down, thr_up)
         test_counts = pd.Series(y_test).value_counts().reindex(CATS).fillna(0).astype(int)
 
         rec.update(
             status='ok',
             class_weight=float(class_weight),
-            threshold=float(thr),
-            val_macro_f1=float(val_f1),
+            beta=float(beta),
+            thr_down=float(thr_down),
+            thr_up=float(thr_up),
+            val_fbeta_down=float(val_fb_down),
+            val_fbeta_up=float(val_fb_up),
             n_train=int(n_train),
             n_val=int(len(y_val)),
             n_test=int(n_test),
             test_accuracy=float((pred_test == y_test).mean()),
-            test_macro_f1=float(f1_score(y_test, pred_test, labels=CATS,
-                                         average='macro', zero_division=0)),
+            test_macro_fbeta=float(fbeta_score(y_test, pred_test, beta=beta, labels=CATS,
+                                               average='macro', zero_division=0)),
             test_n_down=int(test_counts[-2]),
             test_n_flat=int(test_counts[0]),
             test_n_up=int(test_counts[2]),
         )
         rows.append(rec)
         if verbose:
-            print(f'{w.label()}: thr={thr:.3f}  val_F1={val_f1:.4f}  '
-                  f'test_F1={rec["test_macro_f1"]:.4f}  acc={rec["test_accuracy"]:.4f}  '
+            print(f'{w.label()}: thr=(-2:{thr_down:.3f}, +2:{thr_up:.3f})  '
+                  f'val_Fb=(-2:{val_fb_down:.4f}, +2:{val_fb_up:.4f})  '
+                  f'test_Fb={rec["test_macro_fbeta"]:.4f}  acc={rec["test_accuracy"]:.4f}  '
                   f'(n_train={n_train:,}, n_test={n_test:,})')
 
     return pl.DataFrame(rows)
@@ -494,6 +684,7 @@ def predict_target_bins(
     windows: list[RollingWindow],
     target_col: str = 'delta_p_fwd',
     feature_cols: list[str] = TC_FEATURES,
+    beta: float = DEFAULT_BETA,
     min_train_rows: int = 500,
     min_val_rows: int = 50,
     verbose: bool = True,
@@ -506,8 +697,9 @@ def predict_target_bins(
     describes (``pred``). This is exactly the information an executor has at the *start* of the
     target bin (the previous bin's features are already known), so there is no look-ahead.
 
+    For each window the -2 and +2 thresholds are tuned independently on val by F-beta (``beta``).
     Returns one row per OOS target bin: ``security, date, bin_start_time, pred, pred_made,
-    window, threshold`` (``pred`` is null on each session's first bin). None if no window
+    window, thr_down, thr_up`` (``pred`` is null on each session's first bin). None if no window
     produced predictions. Consumed by ``src.vwap.run_improved_vwap_backtest``.
     """
     import numpy as np
@@ -526,7 +718,7 @@ def predict_target_bins(
                 print(f'{w.label()}: SKIP (thin train/val)')
             continue
 
-        thr, _ = tune_threshold(*data['val'])
+        thr_down, thr_up, *_ = tune_thresholds(*data['val'], beta=beta)
 
         # Predict on ALL test bins with present features (do not require a non-null forward
         # target, so the last bin of each session is still scored), keeping the row keys.
@@ -541,15 +733,17 @@ def predict_target_bins(
             continue
 
         probs = np.asarray(res.predict(exog=test.select(feature_cols).to_pandas()))
-        pred_made = assign_classes(probs, thr)
+        pred_made = assign_classes(probs, thr_down, thr_up)
         test = test.with_columns(pred_made=pl.Series('pred_made', pred_made)).with_columns(
             pred=pl.col('pred_made').shift(1).over(['security', 'date']),
             window=pl.lit(w.index),
-            threshold=pl.lit(float(thr)),
+            thr_down=pl.lit(float(thr_down)),
+            thr_up=pl.lit(float(thr_up)),
         )
-        out.append(test.select('security', 'date', 'bin_start_time', 'pred', 'pred_made', 'window', 'threshold'))
+        out.append(test.select('security', 'date', 'bin_start_time', 'pred', 'pred_made',
+                               'window', 'thr_down', 'thr_up'))
         if verbose:
-            print(f'{w.label()}: thr={thr:.3f}  test bins={test.height:,}')
+            print(f'{w.label()}: thr=(-2:{thr_down:.3f}, +2:{thr_up:.3f})  test bins={test.height:,}')
 
     return pl.concat(out) if out else None
 
