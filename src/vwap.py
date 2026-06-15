@@ -49,6 +49,7 @@ Both are emitted for every benchmark; the tick framework requires a `tick` colum
 
 from __future__ import annotations
 
+import numpy as np
 import polars as pl
 
 from src.backtest import compute_volume_curve, historical_volume_curve
@@ -318,6 +319,7 @@ def run_vwap_backtest(
     target_qty: float = 10_000,
     direction: str = 'buy',
     fill_model: str = 'queue',
+    window: int = 1,
     leakage_safe: bool = True,
     curve: pl.DataFrame | None = None,
     df_signals: pl.DataFrame | None = None,
@@ -331,15 +333,16 @@ def run_vwap_backtest(
     `qcode`, `security`, `days_until`, `target_date`, the *_start quotes, volume / signed_volume,
     and `futures_price`). See ``build_schedules`` for the `leakage_safe` curve semantics.
 
-    Pass `df_signals` (carrying `_tick`) to also report costs in ticks per lot (the default
-    evaluation framework); without it only the bp framework is populated.
+    `window` is the order survival length in bins (1 = naive single-bin; larger lets a passive
+    order rest across several bins, raising the passive-fill rate). Pass `df_signals` (carrying
+    `_tick`) to also report costs in ticks per lot (the default framework).
     """
     if df_signals is not None:
         df_cs = attach_tick_sizes(df_cs, df_signals)
     scheduled = build_schedules(
         df_cs, df_cs, target_qty, leakage_safe, curve, qcode_col, position_cols, target_col,
     )
-    sim = simulate_passive_aggressive(scheduled, direction=direction, fill_model=fill_model)
+    sim = simulate_windowed(scheduled, direction=direction, fill_model=fill_model, window=window)
     return per_security_metrics(sim, direction), summarize(sim, direction)
 
 
@@ -468,6 +471,188 @@ def simulate_improved_vwap(
     ).drop(['_force_agg', '_next_cross', '_cross_fallback', '_now_price'])
 
 
+# ── 5b. Multi-bin survival windows (stateful) ──────────────────────────────────────
+
+def _sim_session(sched, opp, tp, ts, cp, deep, ext, pred,
+                 W, queue_model, qdepth, favourable, adverse, is_buy, has_range):
+    """Simulate one [security, date] session with `W`-bin survival windows.
+
+    An order placed at bin i rests over bins [i, i+W-1] and, if not filled, crosses
+    aggressively at the END of its window (the start price of bin i+W). Windows of
+    consecutive bins overlap. Fills/crosses are attributed to the order's OWNER bin (the bin
+    that placed it), so the returned arrays line up with the session's rows. Order layout:
+    ``[owner, limit, qty, queue, expiry, is_deep]``.
+
+    Returns (passive_fill, passive_price, agg_qty, agg_price) per bin.
+    """
+    n = len(sched)
+    pf = np.zeros(n); pp = np.zeros(n); aq = np.zeros(n); ap = np.zeros(n)
+    active: list[list] = []
+
+    def reached(limit, t):
+        if not has_range:
+            return True
+        e = ext[t]
+        return (e <= limit) if is_buy else (e >= limit)
+
+    for t in range(n):
+        # 1. Expire orders whose window ends now -> cross the remainder at this bin's start
+        #    (the "end of window" price); orders not yet due stay active.
+        if active:
+            keep = []
+            for o in active:
+                if o[4] == t:
+                    if o[2] > 0:
+                        aq[o[0]] += o[2]; ap[o[0]] = cp[t]; o[2] = 0.0
+                else:
+                    keep.append(o)
+            active = keep
+
+        # 2. Overlay action on the start-of-bin prediction.
+        p = pred[t]
+        if p == adverse:
+            # Price about to move against us: cross this bin's schedule AND every resting
+            # order immediately at the touch-cross price.
+            tot = sched[t] + sum(o[2] for o in active)
+            if tot > 0:
+                aq[t] += tot; ap[t] = cp[t]
+            active = []
+        elif p == favourable:
+            # Price about to move our way: cancel resting orders and re-place them merged with
+            # this bin's schedule, deeper, on THIS bin's (fresh) window.
+            merged = sum(o[2] for o in active)
+            active = []
+            qty = sched[t] + merged
+            if qty > 0:
+                active.append([t, deep[t], qty, qdepth * ts[t], t + W, True])
+                pp[t] = deep[t]
+        else:
+            if sched[t] > 0:                       # flat / no prediction -> rest at the touch
+                active.append([t, tp[t], sched[t], ts[t], t + W, False])
+                pp[t] = tp[t]
+
+        # 3. Apply this bin's fills to every active order (each evaluated independently against
+        #    the bin's opposing flow / range — see module notes on the per-order simplification).
+        for o in active:
+            if o[2] <= 0 or not reached(o[1], t):
+                continue
+            if queue_model:
+                flow = opp[t]
+                eat = o[3] if o[3] < flow else flow      # opposing flow first clears the queue
+                o[3] -= eat; flow -= eat
+                if flow > 0:
+                    fill = o[2] if o[2] < flow else flow
+                    pf[o[0]] += fill; pp[o[0]] = o[1]; o[2] -= fill
+            else:                                        # hilo: full fill once the range reaches us
+                pf[o[0]] += o[2]; pp[o[0]] = o[1]; o[2] = 0.0
+
+    # 4. End-of-day cleanup: cross every still-resting order at the last bin (no overnight).
+    for o in active:
+        if o[2] > 0:
+            aq[o[0]] += o[2]; ap[o[0]] = cp[n - 1]
+
+    return pf, pp, aq, ap
+
+
+def simulate_windowed(
+    scheduled: pl.DataFrame,
+    direction: str = 'buy',
+    fill_model: str = 'queue',
+    window: int = 1,
+    ticks: int = 2,
+    queue_depth_levels: float = 2.0,
+    pred_col: str | None = None,
+    high_col: str = 'high',
+    low_col: str = 'low',
+) -> pl.DataFrame:
+    """General VWAP execution with `window`-bin order survival (overlapping windows).
+
+    `window` is the survival length in bins: an order rests for `window` bins, then crosses at
+    the end of its window (the next bin's start). `window=1` is the naive non-overlapping
+    framework (place, rest one bin, cross next bin). Larger windows let a resting order sit
+    across several bins so it can fill against more opposing flow — important in tick-constrained
+    books where one bin rarely clears the queue.
+
+    Fill models (per resting order, over its whole window):
+      - 'queue': the cumulative opposing flow over the window must first clear the queue resting
+        ahead at placement (the touch size; ``queue_depth_levels``x it for a deeper overlay
+        order), then fills the order. Each order is scored independently against the market flow
+        (a deliberate simplification — our own orders do not compete for the same prints).
+      - 'hilo' : full fill once the bin range reaches the limit anywhere in the window.
+
+    With `pred_col`, the ordered-logit overlay is active (requires a `tick` column): on a
+    favourable prediction the resting orders are cancelled and merged with the current schedule
+    into one deeper order on a fresh window; on an adverse prediction everything resting is
+    crossed immediately. `window=1` + `pred_col` reproduces the single-bin overlay.
+
+    Emits the per-bin columns ``passive_fill / passive_price / agg_qty / agg_price`` (attributed
+    to each order's owner bin) plus ``mid``, so the metric helpers consume it unchanged.
+    """
+    if direction not in ('buy', 'sell'):
+        raise ValueError(f"direction must be 'buy' or 'sell', got {direction!r}")
+    if fill_model not in ('queue', 'hilo'):
+        raise ValueError(f"fill_model must be 'queue' or 'hilo', got {fill_model!r}")
+    if int(window) < 1:
+        raise ValueError(f"window must be a positive integer (bins), got {window!r}")
+    window = int(window)
+    overlay = pred_col is not None and pred_col in scheduled.columns
+    has_range = high_col in scheduled.columns and low_col in scheduled.columns
+    if fill_model == 'hilo' and not has_range:
+        raise ValueError(
+            f"fill_model='hilo' needs '{high_col}'/'{low_col}' — add HIGH/LOW to "
+            f"pipeline.BINNED_COLS and rebuild. Present: {scheduled.columns}"
+        )
+    if overlay and 'tick' not in scheduled.columns:
+        raise ValueError("overlay (pred_col) needs a `tick` column — call attach_tick_sizes() first.")
+
+    is_buy = direction == 'buy'
+    favourable = -2 if is_buy else 2
+    adverse = 2 if is_buy else -2
+
+    bid, ask = pl.col('bid_start'), pl.col('ask_start')
+    df = scheduled.sort(['security', 'date', 'bin_start_time']).with_columns(mid=(bid + ask) / 2)
+    if is_buy:
+        df = df.with_columns(
+            _opp=((pl.col('volume') - pl.col('signed_volume')) / 2).clip(lower_bound=0),
+            _tp=bid, _ts=pl.col('bid_size_start'), _cp=ask,
+        )
+    else:
+        df = df.with_columns(
+            _opp=((pl.col('volume') + pl.col('signed_volume')) / 2).clip(lower_bound=0),
+            _tp=ask, _ts=pl.col('ask_size_start'), _cp=bid,
+        )
+    if overlay:
+        step = ticks * pl.col('tick')
+        df = df.with_columns(_deep=(pl.col('_tp') - step) if is_buy else (pl.col('_tp') + step))
+    else:
+        df = df.with_columns(_deep=pl.col('_tp'))
+    df = df.with_columns(
+        _ext=(pl.col(low_col) if is_buy else pl.col(high_col)) if has_range else pl.lit(None, dtype=pl.Float64),
+        _pred=pl.col(pred_col).fill_null(0).cast(pl.Int64) if overlay else pl.lit(0, dtype=pl.Int64),
+    )
+
+    arrs = ['scheduled_qty', '_opp', '_tp', '_ts', '_cp', '_deep', '_ext', '_pred']
+    queue_model = fill_model == 'queue'
+    pf_all, pp_all, aq_all, ap_all = [], [], [], []
+    for _key, g in df.group_by(['security', 'date'], maintain_order=True):
+        a = {c: g.get_column(c).to_numpy() for c in arrs}
+        pf, pp, aq, ap = _sim_session(
+            a['scheduled_qty'].astype(float), a['_opp'].astype(float), a['_tp'].astype(float),
+            a['_ts'].astype(float), a['_cp'].astype(float), a['_deep'].astype(float),
+            a['_ext'].astype(float), a['_pred'].astype(int),
+            window, queue_model, queue_depth_levels, favourable, adverse, is_buy, has_range,
+        )
+        pf_all.append(pf); pp_all.append(pp); aq_all.append(aq); ap_all.append(ap)
+
+    df = df.with_columns(
+        passive_fill=pl.Series('passive_fill', np.concatenate(pf_all) if pf_all else np.zeros(0)),
+        passive_price=pl.Series('passive_price', np.concatenate(pp_all) if pp_all else np.zeros(0)),
+        agg_qty=pl.Series('agg_qty', np.concatenate(aq_all) if aq_all else np.zeros(0)),
+        agg_price=pl.Series('agg_price', np.concatenate(ap_all) if ap_all else np.zeros(0)),
+    )
+    return df.drop(['_opp', '_tp', '_ts', '_cp', '_deep', '_ext', '_pred'])
+
+
 # Evaluation frameworks: the cost-column suffix each one uses.
 _FRAMEWORK_UNIT = {'ticks': '_ticks', 'bp': '_bp'}
 
@@ -480,6 +665,7 @@ def run_improved_vwap_backtest(
     direction: str = 'buy',
     fill_model: str = 'hilo',
     ticks: int = 2,
+    window: int = 1,
     leakage_safe: bool = True,
     framework: str = 'ticks',
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -495,6 +681,10 @@ def run_improved_vwap_backtest(
     The headline `improvement_vs_baseline` / `improvement_vs_vwap` columns are in that unit
     (positive = overlay cheaper); per-strategy cost columns are reported in BOTH units so the
     other framework is always one subtraction away.
+
+    `window` is the order survival length in bins, applied identically to both strategies so the
+    comparison stays like-for-like (1 = naive single-bin; larger lets resting orders fill across
+    more bins).
 
     Returns (summary, per_security):
       - `summary`: two rows (baseline_vwap, ordered_logit_vwap) of portfolio metrics + the
@@ -521,8 +711,9 @@ def run_improved_vwap_backtest(
 
     scheduled = build_schedules(df_use, df_cs, target_qty, leakage_safe=leakage_safe)
 
-    base_sim = simulate_passive_aggressive(scheduled, direction=direction, fill_model=fill_model)
-    impr_sim = simulate_improved_vwap(scheduled, direction=direction, fill_model=fill_model, ticks=ticks)
+    base_sim = simulate_windowed(scheduled, direction=direction, fill_model=fill_model, window=window)
+    impr_sim = simulate_windowed(scheduled, direction=direction, fill_model=fill_model,
+                                 window=window, ticks=ticks, pred_col='pred')
 
     base_sum = {'strategy': 'baseline_vwap', **summarize(base_sim, direction)}
     impr_sum = {'strategy': 'ordered_logit_vwap', **summarize(impr_sim, direction)}
@@ -535,8 +726,10 @@ def run_improved_vwap_backtest(
     )
 
     cost_cols = ['cost_vs_vwap_ticks', 'cost_vs_vwap_bp', 'cost_vs_mid_ticks', 'cost_vs_mid_bp']
+    # `total_qty` (lots executed per roll, = target_qty by conservation) is the correct per-lot
+    # weight for aggregating per-roll improvement across rolls — it is what `summarize` pools over.
     base_ps = per_security_metrics(base_sim, direction).select(
-        'security', 'qcode', 'passive_rate', 'exec_avg_price', *cost_cols,
+        'security', 'qcode', 'total_qty', 'passive_rate', 'exec_avg_price', *cost_cols,
     )
     impr_ps = per_security_metrics(impr_sim, direction).select(
         'security',

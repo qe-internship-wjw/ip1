@@ -51,9 +51,11 @@ from src.vwap import (
 
 pl.Config.set_tbl_rows(20)
 pl.Config.set_tbl_cols(30)
-TARGET_QTY = 10_000          # lots to roll per security
-DIRECTION  = 'buy'           # buying calendar spreads
-FILL_MODEL = 'hilo'          # price-range fills (needs HIGH/LOW)""")
+TARGET_QTY  = 10_000         # lots to roll per security
+DIRECTION   = 'buy'          # buying calendar spreads
+FILL_MODEL  = 'hilo'         # price-range fills (needs HIGH/LOW)
+WINDOW      = 3              # order survival window in bins (1 = naive single-bin)
+WINDOW_GRID = [1, 2, 3, 4, 6]  # 5 min .. 30 min, for the window-size sweep""")
 
 md("""## 1. Data
 
@@ -199,15 +201,18 @@ f1m = f1.melt(id_vars='test_start', var_name='split', value_name='macro_f1')
 md("""## 5. Baseline VWAP execution
 
 The baseline rests a passive limit at the touch (best bid when buying) for each bin's scheduled
-quantity; whatever fills passively **saves the spread**, and the unfilled remainder crosses at the next
-bin's start price. The last bin of each session is always crossed (no overnight risk). Costs are signed
-so positive = unfavourable, and reported in two frameworks: **ticks per lot** (the default — e.g. always
-crossing a 1-tick spread costs half a tick over mid) and basis points of the future price. Passing
-`df_signals` supplies the per-BBG tick the tick framework needs.""")
+quantity; whatever fills passively **saves the spread**. With a survival **window** of `W` bins an
+order rests for `W` bins before its unfilled remainder crosses at the end of the window — `W=1` is the
+naive single-bin scheme, while larger `W` lets the order sit across several bins and fill against more
+opposing flow (essential in tick-constrained books where one bin rarely clears the queue). Orders whose
+window reaches the session close are cleaned up at the last bin (no overnight risk). Costs are signed so
+positive = unfavourable, reported in two frameworks: **ticks per lot** (the default — e.g. always
+crossing a 1-tick spread costs half a tick over mid) and basis points of the future price.""")
 
 code("""df_tc = df_cs.filter(pl.col('bbg_code').is_in(TICK_CONSTRAINED_BBG))
 per_base, summ_base = run_vwap_backtest(
-    df_tc, target_qty=TARGET_QTY, direction=DIRECTION, fill_model=FILL_MODEL, df_signals=df_signals,
+    df_tc, target_qty=TARGET_QTY, direction=DIRECTION, fill_model=FILL_MODEL,
+    window=WINDOW, df_signals=df_signals,
 )
 print(f'rolls executed       : {per_base.height}')
 print(f'passive fill rate    : {summ_base["passive_rate"]:.3f}')
@@ -234,7 +239,12 @@ The overlay uses the model's prediction for each target bin (known at its start)
 - predicted **flat** -> behave like the baseline.
 
 `predict_target_bins` produces the out-of-sample, session-shifted predictions; `run_improved_vwap_backtest`
-schedules once and runs both strategies on the **same** rolls for a like-for-like comparison.""")
+schedules once and runs both strategies on the **same** rolls for a like-for-like comparison.
+
+Aggregate improvement is computed **per lot**: each roll is weighted by the lots it executes (`total_qty`,
+which follows the volume curve and equals `TARGET_QTY` by conservation), exactly as
+`summary['improvement_vs_baseline']` pools lots. A plain mean of per-roll ratios, or a market-*volume*
+weighting (a different quantity), is not per-lot and can disagree in sign with the portfolio number.""")
 
 code("""preds = predict_target_bins(df_clean, windows, verbose=False)
 print('predicted target bins:', preds.shape,
@@ -242,8 +252,13 @@ print('predicted target bins:', preds.shape,
 
 summary, per_sec = run_improved_vwap_backtest(
     df_cs, preds, df_signals,
-    target_qty=TARGET_QTY, direction=DIRECTION, fill_model=FILL_MODEL, framework='ticks',
+    target_qty=TARGET_QTY, direction=DIRECTION, fill_model=FILL_MODEL, window=WINDOW, framework='ticks',
 )
+# `per_sec.total_qty` = lots executed per roll (follows the volume curve; = TARGET_QTY by
+# conservation). It is the correct PER-LOT weight for aggregating per-roll improvement -- the same
+# lots that summary['improvement_vs_baseline'] pools over. Weighting by *market* volume instead is
+# a different quantity that over-weights high-volume rolls and can flip the aggregate's sign.
+
 # Headline framework is ticks per lot; bp columns are present too.
 summary.select('strategy', 'framework', 'passive_rate', 'exec_avg_price',
                'cost_vs_vwap_ticks', 'cost_vs_mid_ticks', 'cost_vs_vwap_bp', 'improvement_vs_baseline')""")
@@ -263,39 +278,87 @@ p_cmp = (
 )
 display(p_cmp)
 
-# Per-roll improvement of the overlay over the baseline (positive = overlay cheaper), in ticks/lot.
+# Per-roll improvement (positive = overlay cheaper), ticks/lot. PER-LOT basis: the histogram and the
+# red mean line are weighted by lots executed per roll ('total_qty'), so the mean agrees in sign with
+# summary['improvement_vs_baseline'] (NOT a market-volume weighting, which flipped the sign).
 ps = per_sec.drop_nulls('improvement_vs_vwap').to_pandas()
-mean_impr = ps['improvement_vs_vwap'].mean()
+lot_mean = np.average(ps['improvement_vs_vwap'], weights=ps['total_qty'])
 p_impr = (
-    ggplot(ps, aes('improvement_vs_vwap'))
+    ggplot(ps, aes('improvement_vs_vwap', weight='total_qty'))
     + geom_histogram(bins=40, fill='#1a9850', color='white')
     + geom_vline(xintercept=0, linetype='dashed', color='grey')
-    + geom_vline(xintercept=mean_impr, color='#d73027', size=1)
-    + labs(title=f'Overlay improvement over baseline per roll (mean = {mean_impr:+.3f} ticks/lot)',
-           x='Improvement vs baseline (ticks per lot, positive = overlay cheaper)', y='Rolls')
+    + geom_vline(xintercept=lot_mean, color='#d73027', size=1)
+    + labs(title=f'Overlay improvement over baseline, lot-weighted (mean = {lot_mean:+.3f} ticks/lot)',
+           x='Improvement vs baseline (ticks per lot, positive = overlay cheaper)',
+           y='Lots executed (weight)')
     + theme_bw(base_size=11) + theme(figure_size=(10, 4))
 )
 display(p_impr)""")
 
-code("""# Where does the overlay help or hurt? Improvement by qcode (ticks per lot).
+code("""# Where does the overlay help or hurt? Per-qcode improvement, weighted by lots executed (per-lot):
+# within each qcode, rolls are weighted by their executed lots ('total_qty'), matching summary.
 by_q = (
     per_sec.drop_nulls('improvement_vs_vwap')
     .group_by('qcode').agg(
-        mean_improvement_ticks=pl.col('improvement_vs_vwap').mean(),
+        lot_improvement_ticks=(pl.col('improvement_vs_vwap') * pl.col('total_qty')).sum()
+                              / pl.col('total_qty').sum(),
         rolls=pl.len(),
-    ).sort('mean_improvement_ticks')
+        lots=pl.col('total_qty').sum(),
+    ).sort('lot_improvement_ticks')
     .to_pandas()
 )
 by_q['qcode'] = pd.Categorical(by_q['qcode'], categories=by_q['qcode'].tolist(), ordered=True)
 (
-    ggplot(by_q, aes('qcode', 'mean_improvement_ticks', fill='mean_improvement_ticks > 0'))
+    ggplot(by_q, aes('qcode', 'lot_improvement_ticks', fill='lot_improvement_ticks > 0'))
     + geom_col(show_legend=False)
     + geom_hline(yintercept=0, color='grey')
     + scale_fill_manual(values={True: '#1a9850', False: '#d73027'})
     + coord_flip()
-    + labs(title='Mean overlay improvement by qcode', x='qcode', y='Improvement vs baseline (ticks per lot)')
+    + labs(title='Lot-weighted overlay improvement by qcode', x='qcode',
+           y='Improvement vs baseline (ticks per lot, lot-weighted)')
     + theme_bw(base_size=11) + theme(figure_size=(9, 6))
 )""")
+
+md("""## 6b. Sweeping the survival window
+
+The survival window trades off **fill rate against adverse selection**: a longer window lets passive
+orders fill more often (saving the spread), but an order that sits longer is more likely to be run over
+by an adverse move. We sweep `WINDOW_GRID` and track the passive-fill rate and cost vs market VWAP for
+the baseline and the overlay. Predictions are window-independent, so they are reused across the sweep.""")
+
+code("""sweep_rows = []
+for W in WINDOW_GRID:
+    s_w, _ = run_improved_vwap_backtest(
+        df_cs, preds, df_signals,
+        target_qty=TARGET_QTY, direction=DIRECTION, fill_model=FILL_MODEL, window=W, framework='ticks',
+    )
+    for r in s_w.iter_rows(named=True):
+        sweep_rows.append(dict(window=W, strategy=r['strategy'], passive_rate=r['passive_rate'],
+                               cost_vs_vwap_ticks=r['cost_vs_vwap_ticks'],
+                               cost_vs_mid_ticks=r['cost_vs_mid_ticks']))
+sweep = pl.DataFrame(sweep_rows)
+sweep""")
+
+code("""sw = sweep.to_pandas()
+
+p_pr = (
+    ggplot(sw, aes('window', 'passive_rate', color='strategy'))
+    + geom_line(size=1) + geom_point(size=2)
+    + scale_color_manual(values={'baseline_vwap': '#4575b4', 'ordered_logit_vwap': '#d73027'})
+    + labs(title='Passive-fill rate vs survival window', x='Survival window (bins)',
+           y='Passive fill rate', color='Strategy')
+    + theme_bw(base_size=11) + theme(figure_size=(10, 4))
+)
+p_cost = (
+    ggplot(sw, aes('window', 'cost_vs_vwap_ticks', color='strategy'))
+    + geom_line(size=1) + geom_point(size=2)
+    + geom_hline(yintercept=0, linetype='dashed', color='grey')
+    + scale_color_manual(values={'baseline_vwap': '#4575b4', 'ordered_logit_vwap': '#d73027'})
+    + labs(title='Cost vs market VWAP vs survival window', x='Survival window (bins)',
+           y='Cost vs VWAP (ticks per lot)', color='Strategy')
+    + theme_bw(base_size=11) + theme(figure_size=(10, 4))
+)
+display(p_pr); display(p_cost)""")
 
 md("""## 7. A single roll, illustrated
 
@@ -325,6 +388,9 @@ md("""## Summary & caveats
   the bin being executed.
 - The **baseline VWAP** quantifies the spread it captures passively; the **overlay** reshapes execution
   around the model's directional call.
+- The **survival window** is the main lever on passive-fill rate: in tick-constrained books one bin of
+  flow rarely clears the queue, so orders must rest across several bins to fill. The sweep shows the
+  fill-rate vs adverse-selection trade-off; pick the window where cost vs VWAP bottoms out.
 - Whether the overlay beats the baseline is governed by the model's precision/recall on the +/-2 tails and
   by the fill probability of the 2-tick-deeper passive order. With modest precision (~0.3) the favourable
   signal misfires often, so the gains from resting deeper trade off against the cost of crossing when the
