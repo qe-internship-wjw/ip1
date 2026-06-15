@@ -14,6 +14,8 @@ Stages (each also callable individually for inspection / iteration):
   3. split_spreads_futures    - roll-window filters -> (calendar spreads, futures)
   4. apply_roll_volume_filter - volume-based roll-period filter + futures reference price
   5. generate_signals         - microstructure signals + leakage-safe normalisation
+  6. generate_futures_signals - the SAME signals computed on the outright futures, and
+     attach_outright_signals    buy-/sell-leg outright OBI/STV joined onto each spread bin
 """
 
 import operator
@@ -136,9 +138,7 @@ def preprocess(
     """Join metadata, parse tickers, attach the roll calendar and filter to `years`.
 
     Steps:
-      1. merge BINNED_DATA with QCODE_MAPPING on QCODE (spreads pulled via the name-pattern
-         filter may have QCODEs outside the subset, so their bbg_code / yellow_key /
-         delivery / is_convention_buy_near will be null here),
+      1. merge BINNED_DATA with QCODE_MAPPING on QCODE,
       2. parse SECURITY -> is_spread, near/far identifiers, meta_key,
       3-4. build the per-future roll calendar (target date + own/previous roll windows)
          and join it on meta_key,
@@ -414,6 +414,119 @@ def generate_signals(
     raise ValueError(
         f"normalization must be 'rolling_zscore' or 'time_of_roll', got {normalization!r}"
     )
+
+
+# ── 6. Outright-futures signals + buy/sell-leg augmentation ─────────────────────
+
+def generate_futures_signals(
+    df: pl.DataFrame,
+    train_years: list[int] = TRAIN_YEARS,
+    roll_win: int = ROLL_WIN,
+    normalization: str = 'rolling_zscore',
+) -> pl.DataFrame:
+    """Compute the normalised OBI / STV signals for the OUTRIGHT FUTURES, using exactly the
+    same machinery (`generate_signals`) that produces the calendar-spread signals.
+
+    `df` may be the standalone futures frame (`df_fut`) or the combined frame (`df_combined`);
+    futures are selected with ``~is_spread`` when that flag is present. Two columns that the
+    spread path supplies upstream are reconstructed here so the shared signal code runs
+    unchanged on the futures:
+      - `futures_price`: undefined for an outright leg -> null. It only feeds the spread-only
+        `delta_p_bp`, which is not used for futures, so a null column is harmless.
+      - `days_until`: business days from the bin's date to the contract's own target date
+        (mirrors `split_spreads_futures` for spreads; required by the 'time_of_roll' option).
+
+    Returns one row per surviving future bin with the normalised signal columns. Callers
+    typically keep ``[security, date, bin_start_time, obi, stv]`` for the leg join below.
+    """
+    df_fut = df.filter(~pl.col('is_spread')) if 'is_spread' in df.columns else df
+
+    if 'futures_price' not in df_fut.columns:
+        df_fut = df_fut.with_columns(futures_price=pl.lit(None, dtype=pl.Float64))
+
+    # Recompute days_until for the future's OWN contract (null on combined-frame futures, which
+    # inherit the spread-only column as null from the diagonal concat).
+    df_fut = df_fut.with_columns(
+        days_until=pl.business_day_count(pl.col('date'), pl.col('target_date')),
+    )
+
+    return generate_signals(
+        df_fut, train_years=train_years, roll_win=roll_win, normalization=normalization,
+    )
+
+
+def attach_outright_signals(
+    df_spread_signals: pl.DataFrame,
+    df_futures_signals: pl.DataFrame,
+    signal_cols: tuple[str, ...] = ('obi', 'stv'),
+) -> pl.DataFrame:
+    """Attach the buy-leg and sell-leg outright signals to each calendar-spread bin.
+
+    Using IS_CONVENTION_BUY_NEAR (carried on the spread frame from QCODE_MAPPING) together with
+    the parsed `near_identifier` / `far_identifier`, resolve which leg is bought vs. sold under
+    the spread's quoting convention:
+
+        is_convention_buy_near = True  -> buy = near leg, sell = far leg
+        is_convention_buy_near = False -> buy = far  leg, sell = near leg
+        null  (qcode outside the subset) -> buy/sell undefined -> null leg identifiers
+
+    Then left-join the futures' normalised `signal_cols` for each leg on
+    ``[<leg>_identifier, date, bin_start_time]`` (both sides share the same 5-minute binning),
+    producing `buy_<sig>` / `sell_<sig>` columns. Economic prior for the downstream model: a
+    price improvement on the BUY leg pushes the calendar-spread price up, and vice versa for the
+    sell leg.
+
+    Bins whose leg is absent from the futures frame (e.g. a leg outside its roll window) get
+    null leg signals and are left in place for the modelling step to drop.
+    """
+    is_buy_near = pl.col('is_convention_buy_near').cast(pl.Boolean)
+    buy_id = (
+        pl.when(is_buy_near).then(pl.col('near_identifier'))
+        .when(~is_buy_near).then(pl.col('far_identifier'))
+        .otherwise(None)
+    )
+    sell_id = (
+        pl.when(is_buy_near).then(pl.col('far_identifier'))
+        .when(~is_buy_near).then(pl.col('near_identifier'))
+        .otherwise(None)
+    )
+    df = df_spread_signals.with_columns(buy_identifier=buy_id, sell_identifier=sell_id)
+
+    fut = df_futures_signals.select(['security', 'date', 'bin_start_time', *signal_cols])
+    for side in ('buy', 'sell'):
+        renamed = fut.rename({
+            'security': f'{side}_identifier',
+            **{c: f'{side}_{c}' for c in signal_cols},
+        })
+        df = df.join(renamed, on=[f'{side}_identifier', 'date', 'bin_start_time'], how='left')
+
+    return df
+
+
+def attach_leg_signals(
+    df_signals: pl.DataFrame,
+    df_combined: pl.DataFrame,
+    train_years: list[int] = TRAIN_YEARS,
+    roll_win: int = ROLL_WIN,
+    normalization: str = 'rolling_zscore',
+    signal_cols: tuple[str, ...] = ('obi', 'stv'),
+) -> pl.DataFrame:
+    """Add the buy-/sell-leg outright `signal_cols` to an already-built spread-signals frame.
+
+    One-call orchestrator over `generate_futures_signals` (compute the outright OBI/STV with the
+    SAME normalisation used for the spread signals) and `attach_outright_signals` (resolve the
+    buy/sell legs from IS_CONVENTION_BUY_NEAR and join each leg's signals on
+    ``[<leg>_identifier, date, bin_start_time]``).
+
+    `df_signals` is the output of `generate_signals(df_cs)`; `df_combined` is the second output
+    of `build_datasets` (it carries the outright futures alongside the spreads). Returns
+    `df_signals` with `buy_<sig>` / `sell_<sig>` columns added; rows whose leg is outside its
+    roll window get null leg signals and are dropped by the modelling step's `drop_nulls`.
+    """
+    df_fut_signals = generate_futures_signals(
+        df_combined, train_years=train_years, roll_win=roll_win, normalization=normalization,
+    )
+    return attach_outright_signals(df_signals, df_fut_signals, signal_cols=signal_cols)
 
 
 # ── Top-level entry point ───────────────────────────────────────────────────────
