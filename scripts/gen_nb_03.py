@@ -171,8 +171,9 @@ md("""## 4. Predictive ordered logit, walk-forward
 
 We restrict to the **tick-constrained** curve groups (which trade on a near-discrete grid), clean
 `delta_p` to the ordered set {-2, 0, +2}, and run the class-weighted ordered logit walk-forward: fit on
-train, tune the macro-F1 threshold on validation, evaluate on the held-out test quarter. Each window's
-out-of-sample macro-F1 is plotted over time.""")
+train, tune the **-2 and +2 thresholds independently** on validation (each maximising its tail's
+F-beta, β=0.5 → precision-weighted), evaluate on the held-out test quarter. Each window's
+out-of-sample macro-F-beta is plotted over time.""")
 
 code("""_, df_signals_tc = split_tick_constrained(df_signals)
 df_clean = clean_delta_p_tc(df_signals_tc)
@@ -181,20 +182,23 @@ print('tick-constrained cleaned rows:', df_clean.shape,
 
 results = run_rolling_backtest(df_clean, windows, verbose=False)
 results.filter(pl.col('status') == 'ok').select(
-    'label', 'threshold', 'val_macro_f1', 'test_macro_f1', 'test_accuracy', 'n_train', 'n_test'
+    'label', 'thr_down', 'thr_up', 'val_fbeta_down', 'val_fbeta_up',
+    'test_macro_fbeta', 'test_accuracy', 'n_train', 'n_test'
 )""")
 
-code("""ok = results.filter(pl.col('status') == 'ok')
-f1 = ok.select('test_start', 'val_macro_f1', 'test_macro_f1').to_pandas()
-f1['test_start'] = pd.to_datetime(f1['test_start'])
-f1m = f1.melt(id_vars='test_start', var_name='split', value_name='macro_f1')
+code("""ok = results.filter(pl.col('status') == 'ok').with_columns(
+    val_fbeta_mean=(pl.col('val_fbeta_down') + pl.col('val_fbeta_up')) / 2
+)
+fb = ok.select('test_start', 'val_fbeta_mean', 'test_macro_fbeta').to_pandas()
+fb['test_start'] = pd.to_datetime(fb['test_start'])
+fbm = fb.melt(id_vars='test_start', var_name='split', value_name='fbeta')
 
 (
-    ggplot(f1m, aes('test_start', 'macro_f1', color='split'))
+    ggplot(fbm, aes('test_start', 'fbeta', color='split'))
     + geom_line(size=1) + geom_point(size=2)
-    + scale_color_manual(values={'val_macro_f1': '#f6c700', 'test_macro_f1': '#d73027'})
-    + labs(title='Walk-forward macro-F1 over time (predicting next-bin move)',
-           x='Test quarter', y='Macro-F1', color='Split')
+    + scale_color_manual(values={'val_fbeta_mean': '#f6c700', 'test_macro_fbeta': '#d73027'})
+    + labs(title='Walk-forward F-beta over time (predicting next-bin move)',
+           x='Test quarter', y='Macro F-beta (β=0.5)', color='Split')
     + theme_bw(base_size=11) + theme(figure_size=(11, 4.5))
 )""")
 
