@@ -201,24 +201,27 @@ md("""## 5. Baseline VWAP execution
 The baseline rests a passive limit at the touch (best bid when buying) for each bin's scheduled
 quantity; whatever fills passively **saves the spread**, and the unfilled remainder crosses at the next
 bin's start price. The last bin of each session is always crossed (no overnight risk). Costs are signed
-so positive = unfavourable, in basis points of the future price.""")
+so positive = unfavourable, and reported in two frameworks: **ticks per lot** (the default — e.g. always
+crossing a 1-tick spread costs half a tick over mid) and basis points of the future price. Passing
+`df_signals` supplies the per-BBG tick the tick framework needs.""")
 
 code("""df_tc = df_cs.filter(pl.col('bbg_code').is_in(TICK_CONSTRAINED_BBG))
 per_base, summ_base = run_vwap_backtest(
-    df_tc, target_qty=TARGET_QTY, direction=DIRECTION, fill_model=FILL_MODEL,
+    df_tc, target_qty=TARGET_QTY, direction=DIRECTION, fill_model=FILL_MODEL, df_signals=df_signals,
 )
-print(f'rolls executed      : {per_base.height}')
-print(f'passive fill rate   : {summ_base["passive_rate"]:.3f}')
-print(f'cost vs market VWAP : {summ_base["cost_vs_vwap_bp"]:+.3f} bp')
-print(f'cost vs mid (ideal) : {summ_base["cost_vs_mid_bp"]:+.3f} bp')
-print(f'avg half-spread     : {summ_base["half_spread_bp"]:.3f} bp')
+print(f'rolls executed       : {per_base.height}')
+print(f'passive fill rate    : {summ_base["passive_rate"]:.3f}')
+print(f'cost vs market VWAP  : {summ_base["cost_vs_vwap_ticks"]:+.3f} ticks/lot  ({summ_base["cost_vs_vwap_bp"]:+.2f} bp)')
+print(f'cost vs mid (ideal)  : {summ_base["cost_vs_mid_ticks"]:+.3f} ticks/lot  ({summ_base["cost_vs_mid_bp"]:+.2f} bp)')
+print(f'avg half-spread      : {summ_base["half_spread_ticks"]:.3f} ticks       ({summ_base["half_spread_bp"]:.2f} bp)')
 
 pb = per_base.to_pandas()
 (
-    ggplot(pb, aes('cost_vs_vwap_bp'))
+    ggplot(pb, aes('cost_vs_vwap_ticks'))
     + geom_histogram(bins=40, fill='#4575b4', color='white')
     + geom_vline(xintercept=0, linetype='dashed', color='grey')
-    + labs(title='Baseline VWAP: per-roll cost vs market VWAP', x='Cost vs VWAP (bp)', y='Rolls')
+    + labs(title='Baseline VWAP: per-roll cost vs market VWAP',
+           x='Cost vs VWAP (ticks per lot)', y='Rolls')
     + theme_bw(base_size=11) + theme(figure_size=(10, 4))
 )""")
 
@@ -239,13 +242,14 @@ print('predicted target bins:', preds.shape,
 
 summary, per_sec = run_improved_vwap_backtest(
     df_cs, preds, df_signals,
-    target_qty=TARGET_QTY, direction=DIRECTION, fill_model=FILL_MODEL,
+    target_qty=TARGET_QTY, direction=DIRECTION, fill_model=FILL_MODEL, framework='ticks',
 )
-summary.select('strategy', 'passive_rate', 'exec_avg_price',
-               'cost_vs_vwap_bp', 'cost_vs_mid_bp', 'improvement_vs_baseline_bp')""")
+# Headline framework is ticks per lot; bp columns are present too.
+summary.select('strategy', 'framework', 'passive_rate', 'exec_avg_price',
+               'cost_vs_vwap_ticks', 'cost_vs_mid_ticks', 'cost_vs_vwap_bp', 'improvement_vs_baseline')""")
 
-code("""# Head-to-head: passive rate and cost vs VWAP, baseline vs overlay.
-sm = summary.select('strategy', 'passive_rate', 'cost_vs_vwap_bp', 'cost_vs_mid_bp').to_pandas()
+code("""# Head-to-head: passive rate and cost vs VWAP / mid (ticks per lot), baseline vs overlay.
+sm = summary.select('strategy', 'passive_rate', 'cost_vs_vwap_ticks', 'cost_vs_mid_ticks').to_pandas()
 sm_long = sm.melt(id_vars='strategy', var_name='metric', value_name='value')
 sm_long['strategy'] = pd.Categorical(sm_long['strategy'], ['baseline_vwap', 'ordered_logit_vwap'])
 
@@ -254,42 +258,42 @@ p_cmp = (
     + geom_col(show_legend=False)
     + facet_wrap('~metric', scales='free_y')
     + scale_fill_manual(values={'baseline_vwap': '#4575b4', 'ordered_logit_vwap': '#d73027'})
-    + labs(title='Baseline VWAP vs ordered-logit overlay', x='', y='Value')
+    + labs(title='Baseline VWAP vs ordered-logit overlay (ticks per lot)', x='', y='Value')
     + theme_bw(base_size=11) + theme(figure_size=(11, 4), axis_text_x=element_text(rotation=15))
 )
 display(p_cmp)
 
-# Per-roll improvement of the overlay over the baseline (positive = overlay cheaper).
-ps = per_sec.drop_nulls('improvement_vs_vwap_bp').to_pandas()
-mean_impr = ps['improvement_vs_vwap_bp'].mean()
+# Per-roll improvement of the overlay over the baseline (positive = overlay cheaper), in ticks/lot.
+ps = per_sec.drop_nulls('improvement_vs_vwap').to_pandas()
+mean_impr = ps['improvement_vs_vwap'].mean()
 p_impr = (
-    ggplot(ps, aes('improvement_vs_vwap_bp'))
+    ggplot(ps, aes('improvement_vs_vwap'))
     + geom_histogram(bins=40, fill='#1a9850', color='white')
     + geom_vline(xintercept=0, linetype='dashed', color='grey')
     + geom_vline(xintercept=mean_impr, color='#d73027', size=1)
-    + labs(title=f'Overlay improvement over baseline per roll (mean = {mean_impr:+.2f} bp)',
-           x='Improvement vs baseline (bp, positive = overlay cheaper)', y='Rolls')
+    + labs(title=f'Overlay improvement over baseline per roll (mean = {mean_impr:+.3f} ticks/lot)',
+           x='Improvement vs baseline (ticks per lot, positive = overlay cheaper)', y='Rolls')
     + theme_bw(base_size=11) + theme(figure_size=(10, 4))
 )
 display(p_impr)""")
 
-code("""# Where does the overlay help or hurt? Improvement by qcode.
+code("""# Where does the overlay help or hurt? Improvement by qcode (ticks per lot).
 by_q = (
-    per_sec.drop_nulls('improvement_vs_vwap_bp')
+    per_sec.drop_nulls('improvement_vs_vwap')
     .group_by('qcode').agg(
-        mean_improvement_bp=pl.col('improvement_vs_vwap_bp').mean(),
+        mean_improvement_ticks=pl.col('improvement_vs_vwap').mean(),
         rolls=pl.len(),
-    ).sort('mean_improvement_bp')
+    ).sort('mean_improvement_ticks')
     .to_pandas()
 )
 by_q['qcode'] = pd.Categorical(by_q['qcode'], categories=by_q['qcode'].tolist(), ordered=True)
 (
-    ggplot(by_q, aes('qcode', 'mean_improvement_bp', fill='mean_improvement_bp > 0'))
+    ggplot(by_q, aes('qcode', 'mean_improvement_ticks', fill='mean_improvement_ticks > 0'))
     + geom_col(show_legend=False)
     + geom_hline(yintercept=0, color='grey')
     + scale_fill_manual(values={True: '#1a9850', False: '#d73027'})
     + coord_flip()
-    + labs(title='Mean overlay improvement by qcode', x='qcode', y='Improvement vs baseline (bp)')
+    + labs(title='Mean overlay improvement by qcode', x='qcode', y='Improvement vs baseline (ticks per lot)')
     + theme_bw(base_size=11) + theme(figure_size=(9, 6))
 )""")
 

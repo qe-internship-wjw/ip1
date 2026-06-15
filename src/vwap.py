@@ -29,11 +29,19 @@ Two interchangeable FIFO fill models decide how much of a resting order fills in
       bid fills in full iff the bin's LOW trades down to or through it (``low <= bid``); a
       resting ask fills iff ``high >= ask``. Coarser, ignores queue position.
 
-Metrics (``per_security_metrics`` / ``summarize``) quantify execution quality against two
+Metrics (``per_security_metrics`` / ``summarize``) quantify execution quality against the
 benchmarks — the realised passive-fill rate (spread saved), the schedule-weighted MID
-(unrealistic: assumes every lot trades at mid), and the market VWAP — with costs reported both
-in price units and in basis points of the near-leg future price (the project convention,
-matching ``utils.add_microstructure_signals``'s ``delta_p_bp``).
+(unrealistic: assumes every lot trades at mid), the market VWAP, and arrival mid. Costs are
+reported in two evaluation frameworks:
+
+  - TICKS PER LOT (the default): price cost / tick size. E.g. always crossing a 1-tick-wide
+    spread costs half a tick per lot over mid. This is the natural unit for tick-constrained
+    rolls and is robust to spreads whose outright price is near zero or negative.
+  - BASIS POINTS: price cost * 1e4 / near-leg future price (the project convention, matching
+    ``utils.add_microstructure_signals``'s ``delta_p_bp``).
+
+Both are emitted for every benchmark; the tick framework requires a `tick` column on the bins
+(``attach_tick_sizes``). ``run_improved_vwap_backtest(framework=...)`` picks the headline unit.
 
     from src.vwap import run_vwap_backtest
     per_sec, summary = run_vwap_backtest(df_cs, target_qty=10_000, direction='buy')
@@ -167,9 +175,16 @@ def _side(direction: str) -> int:
 
 
 def _cost_columns(df: pl.DataFrame, side: int) -> pl.DataFrame:
-    """Derive realised average price, benchmarks, and signed costs (price units + bp) from the
-    notional/quantity aggregates already on `df`."""
-    return df.with_columns(
+    """Derive realised average price, benchmarks, and signed costs in BOTH evaluation
+    frameworks from the notional/quantity aggregates already on `df`:
+
+      - ticks per lot  : price cost / tick size (the default; requires an `avg_tick` aggregate),
+      - basis points   : price cost * 1e4 / future price.
+
+    Each baseline (mid, market VWAP, arrival) gets a cost in both units. Costs are signed so
+    positive = unfavourable for either direction. Tick columns are emitted only when `avg_tick`
+    is present (i.e. a `tick` column reached the aggregation)."""
+    df = df.with_columns(
         total_qty=pl.col('passive_qty') + pl.col('agg_qty'),
     ).with_columns(
         passive_rate=pl.col('passive_qty') / pl.col('total_qty'),
@@ -177,16 +192,25 @@ def _cost_columns(df: pl.DataFrame, side: int) -> pl.DataFrame:
         mid_benchmark=pl.col('mid_sched_notional') / pl.col('scheduled_qty'),
         mkt_vwap=pl.col('mkt_vwap_num') / pl.col('mkt_vol'),
     ).with_columns(
-        # Signed so positive = unfavourable vs the benchmark, for either direction.
         cost_vs_mid=side * (pl.col('exec_avg_price') - pl.col('mid_benchmark')),
         cost_vs_vwap=side * (pl.col('exec_avg_price') - pl.col('mkt_vwap')),
         cost_vs_arrival=side * (pl.col('exec_avg_price') - pl.col('arrival_mid')),
-    ).with_columns(
-        cost_vs_mid_bp=pl.col('cost_vs_mid') * 1e4 / pl.col('avg_futures'),
-        cost_vs_vwap_bp=pl.col('cost_vs_vwap') * 1e4 / pl.col('avg_futures'),
-        cost_vs_arrival_bp=pl.col('cost_vs_arrival') * 1e4 / pl.col('avg_futures'),
-        half_spread_bp=pl.col('avg_half_spread') * 1e4 / pl.col('avg_futures'),
     )
+
+    exprs = [
+        (pl.col('cost_vs_mid') * 1e4 / pl.col('avg_futures')).alias('cost_vs_mid_bp'),
+        (pl.col('cost_vs_vwap') * 1e4 / pl.col('avg_futures')).alias('cost_vs_vwap_bp'),
+        (pl.col('cost_vs_arrival') * 1e4 / pl.col('avg_futures')).alias('cost_vs_arrival_bp'),
+        (pl.col('avg_half_spread') * 1e4 / pl.col('avg_futures')).alias('half_spread_bp'),
+    ]
+    if 'avg_tick' in df.columns:
+        exprs += [
+            (pl.col('cost_vs_mid') / pl.col('avg_tick')).alias('cost_vs_mid_ticks'),
+            (pl.col('cost_vs_vwap') / pl.col('avg_tick')).alias('cost_vs_vwap_ticks'),
+            (pl.col('cost_vs_arrival') / pl.col('avg_tick')).alias('cost_vs_arrival_ticks'),
+            (pl.col('avg_half_spread') / pl.col('avg_tick')).alias('half_spread_ticks'),
+        ]
+    return df.with_columns(exprs)
 
 
 _AGG_EXPRS = [
@@ -210,16 +234,19 @@ def per_security_metrics(sim: pl.DataFrame, direction: str = 'buy') -> pl.DataFr
     """One row of execution metrics per roll (security). Securities with an all-zero schedule
     (no historical curve) are dropped. Key columns: ``passive_rate`` (fraction filled passively,
     saving the spread), ``exec_avg_price``, and signed costs vs the mid / VWAP / arrival
-    benchmarks in both price units and bp of the future price."""
-    g = sim.group_by('security', maintain_order=True).agg(_AGG_EXPRS).filter(pl.col('scheduled_qty') > 0)
+    benchmarks in BOTH ticks per lot (default) and bp of the future price. Tick costs require a
+    `tick` column on `sim` (e.g. via ``attach_tick_sizes``)."""
+    aggs = list(_AGG_EXPRS)
+    if 'tick' in sim.columns:
+        aggs.append(pl.col('tick').mean().alias('avg_tick'))
+    g = sim.group_by('security', maintain_order=True).agg(aggs).filter(pl.col('scheduled_qty') > 0)
     return _cost_columns(g, _side(direction)).sort('security')
 
 
 def summarize(sim: pl.DataFrame, direction: str = 'buy') -> dict:
-    """Portfolio-level execution summary (quantity-weighted across all scheduled rolls)."""
-    tot = sim.filter(
-        pl.col('scheduled_qty').sum().over('security') > 0
-    ).select(
+    """Portfolio-level execution summary (quantity-weighted across all scheduled rolls). Costs
+    are reported in both ticks per lot (default) and bp; tick costs require a `tick` column."""
+    selects = [
         pl.col('scheduled_qty').sum().alias('scheduled_qty'),
         pl.col('passive_fill').sum().alias('passive_qty'),
         pl.col('agg_qty').sum().alias('agg_qty'),
@@ -228,14 +255,20 @@ def summarize(sim: pl.DataFrame, direction: str = 'buy') -> dict:
         (pl.col('scheduled_qty') * pl.col('mid')).sum().alias('mid_sched_notional'),
         (pl.col('mid') * pl.col('volume')).sum().alias('mkt_vwap_num'),
         pl.col('volume').sum().alias('mkt_vol'),
-        # Schedule-weighted arrival mid / future price across rolls.
+        # Schedule-weighted arrival mid / future price / tick across rolls.
         ((pl.col('scheduled_qty') * pl.col('mid')).sum()
          / pl.col('scheduled_qty').sum()).alias('arrival_mid'),
         ((pl.col('scheduled_qty') * pl.col('futures_price')).sum()
          / pl.col('scheduled_qty').sum()).alias('avg_futures'),
         ((pl.col('ask_start') - pl.col('bid_start')) / 2).mean().alias('avg_half_spread'),
         pl.col('security').n_unique().alias('n_rolls'),
-    )
+    ]
+    if 'tick' in sim.columns:
+        selects.append(
+            ((pl.col('scheduled_qty') * pl.col('tick')).sum()
+             / pl.col('scheduled_qty').sum()).alias('avg_tick')
+        )
+    tot = sim.filter(pl.col('scheduled_qty').sum().over('security') > 0).select(selects)
     summary = _cost_columns(tot, _side(direction)).row(0, named=True)
     summary['direction'] = direction
     return summary
@@ -287,6 +320,7 @@ def run_vwap_backtest(
     fill_model: str = 'queue',
     leakage_safe: bool = True,
     curve: pl.DataFrame | None = None,
+    df_signals: pl.DataFrame | None = None,
     qcode_col: str = 'qcode',
     position_cols: tuple[str, ...] = ('days_until', 'bin_start_time'),
     target_col: str = 'target_date',
@@ -296,7 +330,12 @@ def run_vwap_backtest(
     `df_cs` is the spread frame from ``pipeline.build_datasets`` (one row per bin, carrying
     `qcode`, `security`, `days_until`, `target_date`, the *_start quotes, volume / signed_volume,
     and `futures_price`). See ``build_schedules`` for the `leakage_safe` curve semantics.
+
+    Pass `df_signals` (carrying `_tick`) to also report costs in ticks per lot (the default
+    evaluation framework); without it only the bp framework is populated.
     """
+    if df_signals is not None:
+        df_cs = attach_tick_sizes(df_cs, df_signals)
     scheduled = build_schedules(
         df_cs, df_cs, target_qty, leakage_safe, curve, qcode_col, position_cols, target_col,
     )
@@ -429,6 +468,10 @@ def simulate_improved_vwap(
     ).drop(['_force_agg', '_next_cross', '_cross_fallback', '_now_price'])
 
 
+# Evaluation frameworks: the cost-column suffix each one uses.
+_FRAMEWORK_UNIT = {'ticks': '_ticks', 'bp': '_bp'}
+
+
 def run_improved_vwap_backtest(
     df_cs: pl.DataFrame,
     predictions: pl.DataFrame,
@@ -438,6 +481,7 @@ def run_improved_vwap_backtest(
     fill_model: str = 'hilo',
     ticks: int = 2,
     leakage_safe: bool = True,
+    framework: str = 'ticks',
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Compare the ordered-logit VWAP to the baseline on the SAME rolls and schedule.
 
@@ -447,17 +491,28 @@ def run_improved_vwap_backtest(
     model actually predicts, so the two strategies are compared like-for-like; the volume-curve
     schedule is identical for both. The session's last bin is forced aggressive in both.
 
+    `framework` selects the headline evaluation unit — 'ticks' (per lot, the default) or 'bp'.
+    The headline `improvement_vs_baseline` / `improvement_vs_vwap` columns are in that unit
+    (positive = overlay cheaper); per-strategy cost columns are reported in BOTH units so the
+    other framework is always one subtraction away.
+
     Returns (summary, per_security):
-      - `summary`: two rows (baseline_vwap, ordered_logit_vwap) of portfolio metrics plus the
-        bp improvement of the overlay over the baseline.
-      - `per_security`: per-roll passive rates and costs for both strategies, side by side.
+      - `summary`: two rows (baseline_vwap, ordered_logit_vwap) of portfolio metrics + the
+        overlay's `improvement_vs_baseline` over the baseline (in `framework` units).
+      - `per_security`: per-roll passive rates and mid/VWAP costs (both units) for both
+        strategies side by side, plus `improvement_vs_vwap`.
     """
+    if framework not in _FRAMEWORK_UNIT:
+        raise ValueError(f"framework must be one of {list(_FRAMEWORK_UNIT)}, got {framework!r}")
     if predictions is None or predictions.height == 0:
         raise ValueError('no predictions — predict_target_bins returned None/empty (every window skipped?).')
+    unit = _FRAMEWORK_UNIT[framework]
+    vwap_cost = f'cost_vs_vwap{unit}'
+
     secs = predictions.select('security').unique()
     df_use = (
         df_cs.join(secs, on='security', how='inner')
-        .pipe(attach_tick_sizes, df_signals)
+        .pipe(attach_tick_sizes, df_signals)   # adds `tick` -> enables the ticks framework
         .join(
             predictions.select('security', 'date', 'bin_start_time', 'pred'),
             on=['security', 'date', 'bin_start_time'], how='left',
@@ -471,21 +526,25 @@ def run_improved_vwap_backtest(
 
     base_sum = {'strategy': 'baseline_vwap', **summarize(base_sim, direction)}
     impr_sum = {'strategy': 'ordered_logit_vwap', **summarize(impr_sim, direction)}
+    if vwap_cost not in base_sum:
+        raise ValueError(f"framework={framework!r} needs '{vwap_cost}' — was a `tick` column available?")
     summary = pl.DataFrame([base_sum, impr_sum]).with_columns(
         # Lower cost is better; positive = overlay beat the baseline (per the signed cost).
-        improvement_vs_baseline_bp=pl.lit(base_sum['cost_vs_vwap_bp'] - impr_sum['cost_vs_vwap_bp']),
+        improvement_vs_baseline=pl.lit(base_sum[vwap_cost] - impr_sum[vwap_cost]),
+        framework=pl.lit(framework),
     )
 
+    cost_cols = ['cost_vs_vwap_ticks', 'cost_vs_vwap_bp', 'cost_vs_mid_ticks', 'cost_vs_mid_bp']
     base_ps = per_security_metrics(base_sim, direction).select(
-        'security', 'qcode', 'passive_rate', 'exec_avg_price', 'cost_vs_vwap_bp', 'cost_vs_mid_bp',
+        'security', 'qcode', 'passive_rate', 'exec_avg_price', *cost_cols,
     )
     impr_ps = per_security_metrics(impr_sim, direction).select(
-        'security', pl.col('passive_rate').alias('passive_rate_impr'),
+        'security',
+        pl.col('passive_rate').alias('passive_rate_impr'),
         pl.col('exec_avg_price').alias('exec_avg_price_impr'),
-        pl.col('cost_vs_vwap_bp').alias('cost_vs_vwap_bp_impr'),
-        pl.col('cost_vs_mid_bp').alias('cost_vs_mid_bp_impr'),
+        *[pl.col(c).alias(f'{c}_impr') for c in cost_cols],
     )
     per_security = base_ps.join(impr_ps, on='security', how='left').with_columns(
-        improvement_vs_vwap_bp=pl.col('cost_vs_vwap_bp') - pl.col('cost_vs_vwap_bp_impr'),
+        improvement_vs_vwap=pl.col(vwap_cost) - pl.col(f'{vwap_cost}_impr'),
     )
     return summary, per_security
