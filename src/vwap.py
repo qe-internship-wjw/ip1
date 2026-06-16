@@ -561,23 +561,29 @@ def _sim_session(sched, opp, tp, ts, cp, deep, ext, pred,
                 active.append([t, tp[t], sched[t], ts[t], t + W, False])
                 pp[t] = tp[t]
 
-        # 3. Apply this bin's fills to every active order (each evaluated independently against
-        #    the bin's opposing flow / range — see module notes on the per-order simplification).
+        # 3. Apply this bin's fills to every active order. The bin's opposing flow is a SHARED
+        #    pool initialised ONCE per bin: orders are processed in placement order and deplete
+        #    it as they consume queue and fill (so resting orders genuinely compete for prints).
+        flow = opp[t]
         for o in active:
             if o[2] <= 0 or not reached(o[1], t):
                 continue
+            if o[5]:
+                # Deep overlay order's first downtick bin: seed the queue ahead with this bin's
+                # top-of-book size ON TOP of the fractional placement depth already in o[3], then
+                # disarm so it only fires on the exact bin where the market reaches our level.
+                o[3] = ts[t] + o[3]; o[5] = False
             walk_through = (ext[t] < o[1]) if is_buy else (ext[t] > o[1])
             if has_range and walk_through:
                 # The market traded ENTIRELY through our resting limit (a strict walk-through):
                 # the order fills 100% passively at its limit regardless of queue position.
                 pf[o[0]] += o[2]; pp[o[0]] = o[1]; o[2] = 0.0
             elif queue_model:                            # touched our limit exactly -> queue race
-                flow = opp[t]
                 eat = o[3] if o[3] < flow else flow      # opposing flow first clears the queue
                 o[3] -= eat; flow -= eat
                 if flow > 0:
                     fill = o[2] if o[2] < flow else flow
-                    pf[o[0]] += fill; pp[o[0]] = o[1]; o[2] -= fill
+                    pf[o[0]] += fill; pp[o[0]] = o[1]; o[2] -= fill; flow -= fill
             else:                                        # hilo: full fill once the range reaches us
                 pf[o[0]] += o[2]; pp[o[0]] = o[1]; o[2] = 0.0
 
@@ -595,7 +601,7 @@ def simulate_windowed(
     fill_model: str = 'queue',
     window: int = 1,
     ticks: int = 2,
-    queue_depth_levels: float = 2.0,
+    queue_depth_levels: float = 0.7,
     pred_col: str | None = None,
     high_col: str = 'high',
     low_col: str = 'low',
