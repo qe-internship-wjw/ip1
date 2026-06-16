@@ -245,32 +245,55 @@ def per_security_metrics(sim: pl.DataFrame, direction: str = 'buy') -> pl.DataFr
 
 
 def summarize(sim: pl.DataFrame, direction: str = 'buy') -> dict:
-    """Portfolio-level execution summary (quantity-weighted across all scheduled rolls). Costs
-    are reported in both ticks per lot (default) and bp; tick costs require a `tick` column."""
+    """Portfolio-level execution summary (quantity-weighted across all scheduled rolls). 
+    Aggregates per-security metrics first to eliminate cross-asset price and tick 
+    distortion while fully preserving all original column names.
+    """
+    # 1. Compute metrics at the security level first to eliminate aggregation bias
+    ps = per_security_metrics(sim, direction)
+    if ps.height == 0:
+        return {'direction': direction}
+
+    total_qty_col = pl.col('total_qty')
+    
+    # 2. Reconstruct portfolio aggregates preserving all original column names
     selects = [
+        # Quantities and raw cash notionals aggregate cleanly as global portfolio sums
         pl.col('scheduled_qty').sum().alias('scheduled_qty'),
-        pl.col('passive_fill').sum().alias('passive_qty'),
+        pl.col('passive_qty').sum().alias('passive_qty'),
         pl.col('agg_qty').sum().alias('agg_qty'),
-        (pl.col('passive_fill') * pl.col('passive_price')
-         + pl.col('agg_qty') * pl.col('agg_price')).sum().alias('exec_notional'),
-        (pl.col('scheduled_qty') * pl.col('mid')).sum().alias('mid_sched_notional'),
-        (pl.col('mid') * pl.col('volume')).sum().alias('mkt_vwap_num'),
-        pl.col('volume').sum().alias('mkt_vol'),
-        # Schedule-weighted arrival mid / future price / tick across rolls.
-        ((pl.col('scheduled_qty') * pl.col('mid')).sum()
-         / pl.col('scheduled_qty').sum()).alias('arrival_mid'),
-        ((pl.col('scheduled_qty') * pl.col('futures_price')).sum()
-         / pl.col('scheduled_qty').sum()).alias('avg_futures'),
-        ((pl.col('ask_start') - pl.col('bid_start')) / 2).mean().alias('avg_half_spread'),
+        pl.col('total_qty').sum().alias('total_qty'),
+        pl.col('exec_notional').sum().alias('exec_notional'),
+        pl.col('mid_sched_notional').sum().alias('mid_sched_notional'),
+        pl.col('mkt_vwap_num').sum().alias('mkt_vwap_num'),
+        pl.col('mkt_vol').sum().alias('mkt_vol'),
         pl.col('security').n_unique().alias('n_rolls'),
     ]
-    if 'tick' in sim.columns:
-        selects.append(
-            ((pl.col('scheduled_qty') * pl.col('tick')).sum()
-             / pl.col('scheduled_qty').sum()).alias('avg_tick')
-        )
-    tot = sim.filter(pl.col('scheduled_qty').sum().over('security') > 0).select(selects)
-    summary = _cost_columns(tot, _side(direction)).row(0, named=True)
+
+    # Helper function to apply true lot-weighted means for prices, spreads, and costs
+    def lot_weighted(col_name: str):
+        return ((pl.col(col_name) * total_qty_col).sum() / total_qty_col.sum()).alias(col_name)
+
+    # Core normalized benchmarks and costs
+    lot_weighted_cols = [
+        'passive_rate', 'exec_avg_price', 'mid_benchmark', 'mkt_vwap', 'arrival_mid',
+        'avg_futures', 'avg_half_spread', 'cost_vs_mid', 'cost_vs_vwap', 'cost_vs_arrival',
+        'cost_vs_mid_bp', 'cost_vs_vwap_bp', 'cost_vs_arrival_bp', 'half_spread_bp'
+    ]
+    for c in lot_weighted_cols:
+        selects.append(lot_weighted(c))
+
+    # Conditional tick framework columns
+    if 'avg_tick' in ps.columns:
+        tick_cols = [
+            'avg_tick', 'cost_vs_mid_ticks', 'cost_vs_vwap_ticks', 
+            'cost_vs_arrival_ticks', 'half_spread_ticks'
+        ]
+        for c in tick_cols:
+            selects.append(lot_weighted(c))
+
+    # 3. Execute the aggregation profile and return as a flat dictionary
+    summary = ps.select(selects).row(0, named=True)
     summary['direction'] = direction
     return summary
 
