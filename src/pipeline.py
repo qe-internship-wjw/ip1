@@ -22,7 +22,6 @@ import polars as pl
 from snowflake.snowpark.session import Session
 
 from src.utils import (
-    add_microstructure_signals,
     build_contract_calendar,
     create_snowpark_session,
     parse_security,
@@ -170,6 +169,152 @@ def apply_roll_volume_filter(
 
 # ── 5. Signal generation + normalisation ───────────────────────────────────────
 
+# Forward-looking columns that are null on the last bin of each session and must be dropped.
+SIGNAL_LAG_COLS = ["delta_p", "delta_lb", "delta_la"]
+
+# Valid choices for the obi_method parameter of add_microstructure_signals.
+OBI_METHODS = ("end_of_bin", "twa", "twa_or_eob")
+
+
+def add_microstructure_signals(
+    df: pl.DataFrame,
+    security_col: str = "security",
+    time_col: str = "bin_start_time",
+    date_col: str = "date",
+    drop_lag_nulls: bool = True,
+    df_fut: pl.DataFrame | None = None,
+    obi_method: str = "end_of_bin",
+) -> pl.DataFrame:
+    """Compute the order-book / flow signals from §3 of the research plan.
+
+    CRITICAL — strictly intraday: all forward-looking quantities are partitioned by the trading
+    session ``[security_col, date_col]`` (not just the contract) and ordered by `time_col`, so a
+    forward step never spans an overnight gap, weekend, or day boundary. `date_col` is derived from
+    `time_col` if absent. The last bin of every (security, date) session therefore has null values.
+
+    Columns added (using the *_START fields as each bin's representative quote, per the spec):
+
+      date              : calendar date of the bin (session key, created if missing)
+      mid_price (P_t)   : (bid_start + ask_start) / 2
+      delta_p  (ΔP_t)   : P_{t+1} - P_t   (within session)
+      obi      (OBI_t)  : bid_size - ask_size, sized by `obi_method` (see below)
+      _obi_denom        : total quoted size (bid + ask) for the same method — denominator for
+                          fractional OBI normalisation in _apply_signal_transforms
+      delta_lb (ΔL_t^b) : 3-case bid liquidity change from t to t+1 (within session)
+      delta_la (ΔL_t^a) : 3-case ask liquidity change from t to t+1 (inequalities mirrored vs. the bid:
+                          an ask *improvement* is a price decrease)
+      ofi      (OFI_t)  : ΔL_t^b - ΔL_t^a   (this is the Cont et al. order-flow imbalance)
+      stv      (STV_t)  : signed_volume from the dataset; empty bins (null) -> 0 trades
+      noi      (NOI_t)  : OFI_t - STV_t
+
+    `obi_method` controls which quote sizes are used for OBI and its denominator:
+      "end_of_bin"  (default) : start-of-next-bin sizes — consistent with the forward-looking
+                                delta_p / OFI, null on the last bin of each session.
+      "twa"                   : time-weighted average sizes (twa_bid_size / twa_ask_size) within
+                                the bin — available for all bins including the last.
+      "twa_or_eob"            : TWA sizes when mid-price is flat (delta_p == 0), end-of-bin sizes
+                                when the price moves — captures state-change accurately while
+                                using the smoother TWA estimate in quiet periods.
+
+    With `drop_lag_nulls=True` the last bin of every session (null forward quantities) is removed.
+    """
+    if obi_method not in OBI_METHODS:
+        raise ValueError(f"obi_method must be one of {OBI_METHODS}, got {obi_method!r}")
+
+    # Session key: derive the calendar date from the bin timestamp if not already present.
+    if date_col not in df.columns:
+        df = df.with_columns(pl.col(time_col).cast(pl.Date).alias(date_col))
+
+    session = [security_col, date_col]
+    df = df.sort([*session, time_col])
+
+    bid, ask = pl.col("bid_start"), pl.col("ask_start")
+    bid_sz, ask_sz = pl.col("bid_size_start"), pl.col("ask_size_start")
+    twa_bid_sz, twa_ask_sz = pl.col("twa_bid_size"), pl.col("twa_ask_size")
+
+    # mid_price must be materialised before the forward shift that produces next_mid.
+    df = df.with_columns(mid_price=(bid + ask) / 2)
+
+    # Next-bin quotes WITHIN the same session — forward-looking, never across day/overnight boundaries.
+    next_bid = bid.shift(-1).over(session)
+    next_ask = ask.shift(-1).over(session)
+    next_bid_sz = bid_sz.shift(-1).over(session)
+    next_ask_sz = ask_sz.shift(-1).over(session)
+    next_mid = pl.col("mid_price").shift(-1).over(session)
+
+    df = df.with_columns(
+        delta_p=next_mid - pl.col("mid_price"),
+        # Bid: next price up -> all new liquidity; next price down -> old liquidity gone; flat -> net change.
+        delta_lb=pl.when(next_bid == bid).then(next_bid_sz - bid_sz)
+        .when(next_bid > bid).then(next_bid_sz)
+        .otherwise(-bid_sz),
+        # Ask: mirrored — next ask price down (improvement) -> all new; price up -> old gone; flat -> net.
+        delta_la=pl.when(next_ask == ask).then(next_ask_sz - ask_sz)
+        .when(next_ask < ask).then(next_ask_sz)
+        .otherwise(-ask_sz),
+    )
+
+    # OBI signed imbalance and its normalisation denominator, chosen by obi_method.
+    if obi_method == "end_of_bin":
+        obi_expr = next_bid_sz - next_ask_sz
+        obi_denom_expr = next_bid_sz + next_ask_sz
+    elif obi_method == "twa":
+        obi_expr = twa_bid_sz - twa_ask_sz
+        obi_denom_expr = twa_bid_sz + twa_ask_sz
+    else:  # "twa_or_eob"
+        price_moved = pl.col("delta_p").is_not_null() & (pl.col("delta_p") != 0)
+        obi_expr = pl.when(price_moved).then(next_bid_sz - next_ask_sz).otherwise(twa_bid_sz - twa_ask_sz)
+        obi_denom_expr = pl.when(price_moved).then(next_bid_sz + next_ask_sz).otherwise(twa_bid_sz + twa_ask_sz)
+
+    df = df.with_columns(
+        obi=obi_expr,
+        _obi_denom=obi_denom_expr,
+    )
+
+    if df_fut is not None:
+        df_fut_avg = (
+            df_fut
+            .with_columns(mid_price=pl.mean_horizontal(['bid_start', 'ask_start']))
+            .group_by([security_col, date_col])
+            .agg(futures_price=pl.col('mid_price').mean())
+        )
+        df = df.sort(date_col)
+        df_fut_avg = df_fut_avg.sort(date_col)
+        df = df.join_asof(
+            df_fut_avg,
+            on=date_col,
+            by_left='near_identifier',
+            by_right=security_col,
+            strategy='backward',
+            allow_exact_matches=False,
+        )
+    elif 'futures_price' not in df.columns:
+        df = df.with_columns(futures_price=pl.lit(None, dtype=pl.Float64))
+
+    df = df.with_columns(
+        delta_p_bp=pl.col('delta_p') * 10000 / pl.col('futures_price')
+    )
+
+    df = df.with_columns(
+        ofi=pl.col("delta_lb") - pl.col("delta_la"),
+        stv=pl.col("signed_volume").fill_null(0),  # no trades in a bin -> signed volume 0
+    ).with_columns(
+        noi=pl.col("ofi") - pl.col("stv"),
+    )
+
+    df = df.with_columns(
+        days_before=pl.business_day_count(
+            pl.col("date").cast(pl.Date),
+            pl.col("target_date").cast(pl.Date),
+        )
+    )
+
+    if drop_lag_nulls:
+        df = df.drop_nulls(subset=SIGNAL_LAG_COLS)
+
+    return df
+
+
 # Flow signals carried as z-score-able / vol-scalable quantities (the others - delta_p and
 # obi - get their own scale normalisation in the transform stage).
 SIGNAL_NORM_COLS = ['ofi', 'stv', 'noi']
@@ -179,12 +324,16 @@ TOR_VOL_WIN = 12
 TOR_VOL_MIN_SAMPLES = 6
 
 
-def _apply_signal_transforms(df_cs: pl.DataFrame, df_fut: pl.DataFrame | None = None) -> pl.DataFrame:
+def _apply_signal_transforms(
+    df_cs: pl.DataFrame,
+    df_fut: pl.DataFrame | None = None,
+    obi_method: str = "end_of_bin",
+) -> pl.DataFrame:
     """Microstructure signals + the *scale* transforms that are independent of any split.
 
     Produces (all overwriting the raw columns):
       - delta_p : in ticks (per-BBG_CODE tick size, kept as `_tick`),
-      - obi     : fraction of total quoted size at the touch,
+      - obi     : fraction of total quoted size at the touch (denominator chosen by `obi_method`),
       - stv/noi : signed square root (variance-stabilising, sign-preserving),
       - ofi     : left RAW here (its location/scale normalisation happens downstream).
 
@@ -192,7 +341,9 @@ def _apply_signal_transforms(df_cs: pl.DataFrame, df_fut: pl.DataFrame | None = 
     this stage is identical for every normalisation strategy. ``fill_nan(None)`` converts
     floating-point 0/0 = NaN for inactive bins to null rather than propagating NaN.
     """
-    df_signals = add_microstructure_signals(df_cs, security_col='security', time_col='bin_start_time', df_fut=df_fut)
+    df_signals = add_microstructure_signals(
+        df_cs, security_col='security', time_col='bin_start_time', df_fut=df_fut, obi_method=obi_method,
+    )
 
     # Tick size per BBG_CODE: minimum strictly-positive |delta_p| (drop zero / near-zero
     # changes so noise is not mistaken for the tick).
@@ -206,10 +357,10 @@ def _apply_signal_transforms(df_cs: pl.DataFrame, df_fut: pl.DataFrame | None = 
 
     return df_signals.with_columns(
         delta_p=(pl.col('delta_p') / pl.col('_tick')).fill_nan(None),
-        obi=(pl.col('obi') / (pl.col('bid_size_start') + pl.col('ask_size_start'))).fill_nan(None),
+        obi=(pl.col('obi') / pl.col('_obi_denom')).fill_nan(None),
         stv=(pl.col('stv').cast(pl.Float64).abs().sqrt() * pl.col('stv').sign()).fill_nan(None),
         noi=(pl.col('noi').cast(pl.Float64).abs().sqrt() * pl.col('noi').sign()).fill_nan(None),
-    )
+    ).drop('_obi_denom')
 
 
 def _normalize_time_of_roll(
@@ -281,22 +432,23 @@ def _normalize_time_of_roll(
 def generate_signals(
     df_cs: pl.DataFrame,
     df_fut: pl.DataFrame | None = None,
+    obi_method: str = "end_of_bin",
 ) -> pl.DataFrame:
     """Microstructure signals (partitioned by SESSION [security, date]) + time-of-roll normalisation.
 
     Normalised values overwrite the raw columns so downstream sections use them automatically:
 
       1. delta_p in ticks (per-BBG_CODE tick size, kept as `_tick`),
-      2. OBI as fraction of total quoted size at the touch,
+      2. OBI as fraction of total quoted size at the touch (denominator set by `obi_method`),
       3-5. OFI / STV / NOI divided by a volatility profiled by roll stage from prior rolls only
            (see ``_normalize_time_of_roll``); requires `qcode`, `days_until`, `target_date`.
     """
-    return _normalize_time_of_roll(_apply_signal_transforms(df_cs, df_fut=df_fut))
+    return _normalize_time_of_roll(_apply_signal_transforms(df_cs, df_fut=df_fut, obi_method=obi_method))
 
 
 # ── 6. Outright-futures signals + buy/sell-leg augmentation ─────────────────────
 
-def generate_futures_signals(df: pl.DataFrame) -> pl.DataFrame:
+def generate_futures_signals(df: pl.DataFrame, obi_method: str = "end_of_bin") -> pl.DataFrame:
     """Compute the normalised OBI / STV signals for the OUTRIGHT FUTURES.
 
     `df` may be the standalone futures frame (`df_fut`) or the combined frame (`df_combined`);
@@ -310,7 +462,7 @@ def generate_futures_signals(df: pl.DataFrame) -> pl.DataFrame:
     df_fut = df_fut.with_columns(
         days_until=pl.business_day_count(pl.col('date'), pl.col('target_date')),
     )
-    return generate_signals(df_fut)
+    return generate_signals(df_fut, obi_method=obi_method)
 
 
 def attach_outright_signals(
@@ -365,6 +517,7 @@ def attach_leg_signals(
     df_signals: pl.DataFrame,
     df_combined: pl.DataFrame,
     signal_cols: tuple[str, ...] = ('obi', 'stv'),
+    obi_method: str = "end_of_bin",
 ) -> pl.DataFrame:
     """Add the buy-/sell-leg outright `signal_cols` to an already-built spread-signals frame.
 
@@ -374,7 +527,7 @@ def attach_leg_signals(
     rows whose leg is outside its roll window get null leg signals.
     """
     return attach_outright_signals(
-        df_signals, generate_futures_signals(df_combined), signal_cols=signal_cols,
+        df_signals, generate_futures_signals(df_combined, obi_method=obi_method), signal_cols=signal_cols,
     )
 
 
