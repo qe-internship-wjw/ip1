@@ -44,10 +44,17 @@ def _sim_session(sched, opp, tp, ts, cp, deep, ext, pred,
     followed by a deeper fill on a favourable downtick yields a correct quantity-weighted
     ``passive_price`` rather than a clobbered scalar.
 
-    Returns (passive_fill, passive_price, agg_qty, agg_price) per bin.
+    Two extra arrays, ``pf_x`` / ``aq_x``, attribute the SAME fills/crosses to the bin where they
+    ACTUALLY trade (the execution bin) rather than the owner bin — the schedule is owner-attributed
+    and so identical across strategies, but realised execution timing is not (an overlay reschedules
+    fills by resting deeper / crossing early). These drive the per-bin traded-volume visualisation;
+    metrics keep using the owner-attributed arrays.
+
+    Returns (passive_fill, passive_price, agg_qty, agg_price, passive_traded, agg_traded) per bin.
     """
     n = len(sched)
     pf = np.zeros(n); pcash = np.zeros(n); aq = np.zeros(n); ap = np.zeros(n)
+    pf_x = np.zeros(n); aq_x = np.zeros(n)         # traded volume by EXECUTION bin (for viz)
     active: list[list] = []
     bundle_states: dict = {}                       # bundle_id -> {"queue_ahead", "is_deep", ...}
 
@@ -64,7 +71,7 @@ def _sim_session(sched, opp, tp, ts, cp, deep, ext, pred,
             for o in active:
                 if o[3] == t:
                     if o[2] > 0:
-                        aq[o[0]] += o[2]; ap[o[0]] = cp[t]; o[2] = 0.0
+                        aq[o[0]] += o[2]; aq_x[t] += o[2]; ap[o[0]] = cp[t]; o[2] = 0.0
                 else:
                     keep.append(o)
             active = keep
@@ -74,9 +81,9 @@ def _sim_session(sched, opp, tp, ts, cp, deep, ext, pred,
         if p == adverse:
             for o in active:
                 if o[2] > 0:
-                    aq[o[0]] += o[2]; ap[o[0]] = cp[t]; o[2] = 0.0
+                    aq[o[0]] += o[2]; aq_x[t] += o[2]; ap[o[0]] = cp[t]; o[2] = 0.0
             if sched[t] > 0:
-                aq[t] += sched[t]; ap[t] = cp[t]
+                aq[t] += sched[t]; aq_x[t] += sched[t]; ap[t] = cp[t]
             active = []
         elif p == favourable:
             b_id = f"deep_{t}"
@@ -117,8 +124,10 @@ def _sim_session(sched, opp, tp, ts, cp, deep, ext, pred,
                 b_id = o[4]
                 bs = bundle_states[b_id]
 
-                # Dynamic Queue Sync: Adjust queue positions using current market reality
-                if o[1] == tp[t]:
+                # Dynamic Queue Sync (BASELINE touch orders only): track cancellations at the
+                # touch. Deep overlay bundles are excluded so the 0.7 placement-depth fraction is
+                # never capped/clobbered by touch-tracking when the touch falls to their level.
+                if not bs["deep_origin"] and o[1] == tp[t]:
                     if bs.get("last_touch_price") != tp[t]:
                         # Market moved away and just returned to our level: reset queue position
                         bs["queue_ahead"] = ts[t]
@@ -128,8 +137,10 @@ def _sim_session(sched, opp, tp, ts, cp, deep, ext, pred,
                     bs["last_touch_price"] = tp[t]
 
                 if bs["is_deep"]:
-                    if t != bs["placed_at"]:
-                        bs["queue_ahead"] += ts[t]
+                    # Downtick reached: the cumulative-flow requirement is the downtick bin's
+                    # top-of-book (ts[t]) ON TOP of the 0.7 placement-depth fraction -- always,
+                    # even when the downtick happens in the very bin the order was placed.
+                    bs["queue_ahead"] += ts[t]
                     bs["is_deep"] = False
 
                 if b_id not in q_init:
@@ -145,10 +156,13 @@ def _sim_session(sched, opp, tp, ts, cp, deep, ext, pred,
                 bs = bundle_states[o[4]]
                 qi = q_init[o[4]]
 
+                # Trade-through: if the bin prints STRICTLY through our limit the depth ahead must
+                # have cleared, so the order fills in full at its limit -- for deep overlay orders
+                # just as for baseline touch orders.
                 walk_through = (ext[t] < o[1]) if is_buy else (ext[t] > o[1])
-                if has_range and walk_through and not bs["deep_origin"]:
+                if has_range and walk_through:
                     consumed += qi + o[2]
-                    pf[o[0]] += o[2]; pcash[o[0]] += o[2] * o[1]; o[2] = 0.0
+                    pf[o[0]] += o[2]; pf_x[t] += o[2]; pcash[o[0]] += o[2] * o[1]; o[2] = 0.0
                     continue
 
                 avail = (V - qi) - consumed
@@ -157,7 +171,7 @@ def _sim_session(sched, opp, tp, ts, cp, deep, ext, pred,
 
                 fill = o[2] if o[2] < avail else avail
                 o[2] -= fill; consumed += fill
-                pf[o[0]] += fill; pcash[o[0]] += fill * o[1]
+                pf[o[0]] += fill; pf_x[t] += fill; pcash[o[0]] += fill * o[1]
         else:
             # hilo matching logic
             for o in active:
@@ -165,18 +179,18 @@ def _sim_session(sched, opp, tp, ts, cp, deep, ext, pred,
                     continue
                 bs = bundle_states[o[4]]
                 bs["is_deep"] = False
-                pf[o[0]] += o[2]; pcash[o[0]] += o[2] * o[1]; o[2] = 0.0
+                pf[o[0]] += o[2]; pf_x[t] += o[2]; pcash[o[0]] += o[2] * o[1]; o[2] = 0.0
 
     # 4. End-of-day cleanup: cross every still-resting order at the last bin
     for o in active:
         if o[2] > 0:
-            aq[o[0]] += o[2]; ap[o[0]] = cp[n - 1]
+            aq[o[0]] += o[2]; aq_x[n - 1] += o[2]; ap[o[0]] = cp[n - 1]
 
     pp = tp.copy()
     filled = pf > 0
     pp[filled] = pcash[filled] / pf[filled]
 
-    return pf, pp, aq, ap
+    return pf, pp, aq, ap, pf_x, aq_x
 
 
 def simulate_windowed(
@@ -210,7 +224,9 @@ def simulate_windowed(
     crossed immediately. `window=1` + `pred_col` reproduces the single-bin overlay.
 
     Emits the per-bin columns ``passive_fill / passive_price / agg_qty / agg_price`` (attributed
-    to each order's owner bin) plus ``mid``, so the metric helpers consume it unchanged.
+    to each order's owner bin) plus ``mid``, so the metric helpers consume it unchanged. Two
+    further columns ``passive_traded / agg_traded`` give the same fills/crosses attributed to the
+    bin where they actually trade (execution timing), for visualising realised intraday execution.
     """
     if direction not in ('buy', 'sell'):
         raise ValueError(f"direction must be 'buy' or 'sell', got {direction!r}")
@@ -257,21 +273,25 @@ def simulate_windowed(
 
     arrs = ['scheduled_qty', '_opp', '_tp', '_ts', '_cp', '_deep', '_ext', '_pred']
     queue_model = fill_model == 'queue'
-    pf_all, pp_all, aq_all, ap_all = [], [], [], []
+    pf_all, pp_all, aq_all, ap_all, pfx_all, aqx_all = [], [], [], [], [], []
     for _key, g in df.group_by(['security', 'date'], maintain_order=True):
         a = {c: g.get_column(c).to_numpy() for c in arrs}
-        pf, pp, aq, ap = _sim_session(
+        pf, pp, aq, ap, pf_x, aq_x = _sim_session(
             a['scheduled_qty'].astype(float), a['_opp'].astype(float), a['_tp'].astype(float),
             a['_ts'].astype(float), a['_cp'].astype(float), a['_deep'].astype(float),
             a['_ext'].astype(float), a['_pred'].astype(int),
             window, queue_model, queue_depth_levels, favourable, adverse, is_buy, has_range,
         )
         pf_all.append(pf); pp_all.append(pp); aq_all.append(aq); ap_all.append(ap)
+        pfx_all.append(pf_x); aqx_all.append(aq_x)
 
+    _cat = lambda parts: np.concatenate(parts) if parts else np.zeros(0)
     df = df.with_columns(
-        passive_fill=pl.Series('passive_fill', np.concatenate(pf_all) if pf_all else np.zeros(0)),
-        passive_price=pl.Series('passive_price', np.concatenate(pp_all) if pp_all else np.zeros(0)),
-        agg_qty=pl.Series('agg_qty', np.concatenate(aq_all) if aq_all else np.zeros(0)),
-        agg_price=pl.Series('agg_price', np.concatenate(ap_all) if ap_all else np.zeros(0)),
+        passive_fill=pl.Series('passive_fill', _cat(pf_all)),
+        passive_price=pl.Series('passive_price', _cat(pp_all)),
+        agg_qty=pl.Series('agg_qty', _cat(aq_all)),
+        agg_price=pl.Series('agg_price', _cat(ap_all)),
+        passive_traded=pl.Series('passive_traded', _cat(pfx_all)),
+        agg_traded=pl.Series('agg_traded', _cat(aqx_all)),
     )
     return df.drop(['_opp', '_tp', '_ts', '_cp', '_deep', '_ext', '_pred'])
