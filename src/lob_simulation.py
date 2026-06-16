@@ -197,20 +197,30 @@ def simulate_windowed(
     scheduled: pl.DataFrame,
     direction: str = 'buy',
     fill_model: str = 'queue',
-    window: int = 1,
+    window_fraction: float = 0.3,
     ticks: int = 2,
     queue_depth_levels: float = 0.7,
     pred_col: str | None = None,
     high_col: str = 'high',
     low_col: str = 'low',
 ) -> pl.DataFrame:
-    """General VWAP execution with `window`-bin order survival (overlapping windows).
+    """General VWAP execution with a PER-SECURITY order survival window (overlapping windows).
 
-    `window` is the survival length in bins: an order rests for `window` bins, then crosses at
-    the end of its window (the next bin's start). `window=1` is the naive non-overlapping
-    framework (place, rest one bin, cross next bin). Larger windows let a resting order sit
-    across several bins so it can fill against more opposing flow — important in tick-constrained
-    books where one bin rarely clears the queue.
+    Rather than a single survival length for every security, the window is sized from each
+    security's own queue dynamics. The touch-size-to-trade-volume ratio (mean resting depth on
+    our side / mean bin trade volume) is a simple estimator of queue time — how many bins of
+    opposing flow are needed to clear the depth ahead. The survival window is `window_fraction`
+    of that ratio, rounded and floored at 1 bin:
+
+        W(security) = max(1, round(window_fraction * mean(touch_size) / mean(volume)))
+
+    e.g. a security whose touch is ~20x its per-bin volume, at the default ``window_fraction=0.3``,
+    rests an order for ~6 bins. An order rests for `W` bins, then crosses at the end of its window
+    (the next bin's start); `W=1` is the naive non-overlapping framework. Larger windows let a
+    resting order sit across several bins so it can fill against more opposing flow — important in
+    tick-constrained books where one bin rarely clears the queue. The window is computed off the
+    `scheduled` frame, so the SAME per-security window applies to the baseline and any overlay run
+    over the same frame (keeping a comparison like-for-like).
 
     Fill models (per resting order, over its whole window):
       - 'queue': the cumulative opposing flow over the window must first clear the queue resting
@@ -221,7 +231,8 @@ def simulate_windowed(
     With `pred_col`, the ordered-logit overlay is active (requires a `tick` column): on a
     favourable prediction the resting orders are cancelled and merged with the current schedule
     into one deeper order on a fresh window; on an adverse prediction everything resting is
-    crossed immediately. `window=1` + `pred_col` reproduces the single-bin overlay.
+    crossed immediately. A small enough `window_fraction` (single-bin windows) + `pred_col`
+    reproduces the single-bin overlay.
 
     Emits the per-bin columns ``passive_fill / passive_price / agg_qty / agg_price`` (attributed
     to each order's owner bin) plus ``mid``, so the metric helpers consume it unchanged. Two
@@ -232,9 +243,8 @@ def simulate_windowed(
         raise ValueError(f"direction must be 'buy' or 'sell', got {direction!r}")
     if fill_model not in ('queue', 'hilo'):
         raise ValueError(f"fill_model must be 'queue' or 'hilo', got {fill_model!r}")
-    if int(window) < 1:
-        raise ValueError(f"window must be a positive integer (bins), got {window!r}")
-    window = int(window)
+    if window_fraction <= 0:
+        raise ValueError(f"window_fraction must be positive, got {window_fraction!r}")
     overlay = pred_col is not None and pred_col in scheduled.columns
     has_range = high_col in scheduled.columns and low_col in scheduled.columns
     if fill_model == 'hilo' and not has_range:
@@ -271,16 +281,34 @@ def simulate_windowed(
         _pred=pl.col(pred_col).fill_null(0).cast(pl.Int64) if overlay else pl.lit(0, dtype=pl.Int64),
     )
 
+    # Per-security survival window: window_fraction * (mean touch size / mean trade volume),
+    # rounded and floored at 1 bin. `_ts` is the resting depth on OUR side (bid for a buy, ask
+    # for a sell); `volume` is the bin's trade volume. A security with no traded volume falls
+    # back to a single-bin window.
+    win = (
+        df.group_by('security', maintain_order=True)
+        .agg(_avg_ts=pl.col('_ts').mean(), _avg_vol=pl.col('volume').mean())
+        .with_columns(
+            _window=pl.when(pl.col('_avg_vol') > 0)
+            .then((window_fraction * pl.col('_avg_ts') / pl.col('_avg_vol')).round())
+            .otherwise(1.0)
+            .clip(lower_bound=1.0)
+            .cast(pl.Int64)
+        )
+    )
+    window_by_sec = dict(zip(win['security'].to_list(), win['_window'].to_list()))
+
     arrs = ['scheduled_qty', '_opp', '_tp', '_ts', '_cp', '_deep', '_ext', '_pred']
     queue_model = fill_model == 'queue'
     pf_all, pp_all, aq_all, ap_all, pfx_all, aqx_all = [], [], [], [], [], []
     for _key, g in df.group_by(['security', 'date'], maintain_order=True):
         a = {c: g.get_column(c).to_numpy() for c in arrs}
+        W = window_by_sec.get(_key[0], 1)
         pf, pp, aq, ap, pf_x, aq_x = _sim_session(
             a['scheduled_qty'].astype(float), a['_opp'].astype(float), a['_tp'].astype(float),
             a['_ts'].astype(float), a['_cp'].astype(float), a['_deep'].astype(float),
             a['_ext'].astype(float), a['_pred'].astype(int),
-            window, queue_model, queue_depth_levels, favourable, adverse, is_buy, has_range,
+            W, queue_model, queue_depth_levels, favourable, adverse, is_buy, has_range,
         )
         pf_all.append(pf); pp_all.append(pp); aq_all.append(aq); ap_all.append(ap)
         pfx_all.append(pf_x); aqx_all.append(aq_x)

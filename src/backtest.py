@@ -230,6 +230,50 @@ def historical_volume_curve(
     return compute_volume_curve(past, group_col, position_cols, volume_col)
 
 
+def compute_roll_volume(
+    df_cs: pl.DataFrame,
+    group_col: str = 'qcode',
+    volume_col: str = 'volume',
+) -> pl.DataFrame:
+    """Average total roll volume per ``group_col`` (qcode).
+
+    Each roll period is a distinct ``security``; its total roll volume is the sum of its bin
+    volumes. We average those per-roll totals across all rolls (securities) of the same group,
+    so a participation-rate scheduler can size each roll as a fixed fraction of the group's
+    typical roll volume rather than a fixed lot count.
+
+    Returns one row per group with:
+      avg_roll_volume : cross-roll mean of the per-security total volume,
+      n_securities    : number of distinct rolls contributing (diagnostic).
+    """
+    sec_total = df_cs.group_by([group_col, 'security']).agg(_sec_total=pl.col(volume_col).sum())
+    return (
+        sec_total.group_by(group_col)
+        .agg(
+            avg_roll_volume=pl.col('_sec_total').mean(),
+            n_securities=pl.col('security').n_unique(),
+        )
+        .sort(group_col)
+    )
+
+
+def historical_roll_volume(
+    df_cs: pl.DataFrame,
+    before: date,
+    group_col: str = 'qcode',
+    volume_col: str = 'volume',
+    target_col: str = 'target_date',
+) -> pl.DataFrame:
+    """Leakage-safe ``compute_roll_volume``: only rolls that *completed* before `before`.
+
+    Mirrors ``historical_volume_curve`` — restricting to ``target_date < before`` means a
+    participation-rate schedule backtested over a test window only ever sizes a roll from rolls
+    that finished before that window began. Pass the test window's ``test_start`` as `before`.
+    """
+    past = df_cs.filter(pl.col(target_col).cast(pl.Date) < before)
+    return compute_roll_volume(past, group_col, volume_col)
+
+
 # ── 3. Walk-forward driver ──────────────────────────────────────────────────────────
 
 def run_rolling_backtest(

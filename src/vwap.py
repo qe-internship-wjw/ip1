@@ -1,14 +1,17 @@
 """Baseline VWAP execution algorithm for rolling calendar spreads.
 
-The institutional roller's problem: migrate a fixed quantity (e.g. 10,000 lots) from the near
-to the far contract over a roll period, as cheaply as possible. This module implements the
-passive-then-aggressive baseline that the predictive ordered-logit model (see
-``src/backtest.py``) must later beat:
+The institutional roller's problem: migrate a quantity from the near to the far contract over a
+roll period, as cheaply as possible. The quantity is sized as a ``participation_rate`` of the
+qcode's average total roll volume (e.g. 5% of a typical 100k-lot roll = 5k lots), so each
+security's target scales with its own liquidity. This module implements the passive-then-
+aggressive baseline that the predictive ordered-logit model (see ``src/backtest.py``) must beat:
 
-    1. SCHEDULE — slice the target quantity across the roll's 5-minute bins in proportion to the
-       historical volume curve (``src.backtest.compute_volume_curve`` /
-       ``historical_volume_curve``), so more is worked when the market is liquid. Each roll
-       period is a distinct ``security``; the curve is built from PRIOR rolls of the ``qcode``.
+    1. SCHEDULE — set each roll's target to ``participation_rate`` of its qcode's average roll
+       volume (``src.backtest.compute_roll_volume`` / ``historical_roll_volume``), then slice
+       that target across the roll's 5-minute bins in proportion to the historical volume curve
+       (``src.backtest.compute_volume_curve`` / ``historical_volume_curve``), so more is worked
+       when the market is liquid. Each roll period is a distinct ``security``; both the curve and
+       the roll-volume average are built from PRIOR rolls of the ``qcode``.
 
     2. EXECUTE (per bin, buying spreads) — rest a passive limit at the best bid for the bin's
        scheduled quantity. Whatever fills passively saves the spread. Whatever is unfilled at
@@ -44,7 +47,7 @@ Both are emitted for every benchmark; the tick framework requires a `tick` colum
 (``attach_tick_sizes``). ``run_improved_vwap_backtest(framework=...)`` picks the headline unit.
 
     from src.vwap import run_vwap_backtest
-    per_sec, summary = run_vwap_backtest(df_cs, target_qty=10_000, direction='buy')
+    per_sec, summary = run_vwap_backtest(df_cs, participation_rate=0.05, direction='buy')
 """
 
 from __future__ import annotations
@@ -52,7 +55,12 @@ from __future__ import annotations
 import numpy as np
 import polars as pl
 
-from src.backtest import compute_volume_curve, historical_volume_curve
+from src.backtest import (
+    compute_volume_curve,
+    historical_volume_curve,
+    compute_roll_volume,
+    historical_roll_volume,
+)
 # The stateful limit-order-book / queue matching engine lives in its own module; re-exported here
 # so existing ``from src.vwap import simulate_windowed`` call sites keep working.
 from src.lob_simulation import simulate_windowed
@@ -66,28 +74,35 @@ _PRICE_COLS = ['bid_start', 'ask_start', 'bid_size_start', 'ask_size_start', 'vo
 def attach_volume_schedule(
     roll_bins: pl.DataFrame,
     curve: pl.DataFrame,
-    target_qty: float,
+    roll_volume: pl.DataFrame,
+    participation_rate: float = 0.05,
     qcode_col: str = 'qcode',
     position_cols: tuple[str, ...] = ('days_until', 'bin_start_time'),
 ) -> pl.DataFrame:
-    """Attach ``scheduled_qty`` to each bin by spreading `target_qty` across a security's bins
-    in proportion to `curve`'s volume fractions.
+    """Attach ``scheduled_qty`` to each bin.
 
-    The curve carries ``volume_fraction`` per (qcode, *position_cols). We join it on, fill
-    missing buckets with 0, then renormalise WITHIN each security so the schedule sums exactly
-    to `target_qty` (the roll's realised bins rarely cover every curve bucket). A security with
-    no overlapping history (e.g. the first roll of a qcode) gets an all-zero schedule and is
+    Each roll's target quantity is ``participation_rate`` of its qcode's average total roll
+    volume (`roll_volume`'s ``avg_roll_volume`` — see ``src.backtest.compute_roll_volume``); that
+    target is then spread across the security's bins in proportion to `curve`'s volume fractions.
+
+    The curve carries ``volume_fraction`` per (qcode, *position_cols). We join it and the
+    per-qcode roll volume on, fill missing buckets with 0, then renormalise WITHIN each security
+    so the schedule sums exactly to the security's target (the roll's realised bins rarely cover
+    every curve bucket). A security with no overlapping history (e.g. the first roll of a qcode,
+    which has neither a curve nor a roll-volume estimate) gets an all-zero schedule and is
     skipped by the metrics.
     """
     pos = list(position_cols)
     c = curve.select([qcode_col, *pos, 'volume_fraction'])
-    out = roll_bins.join(c, on=[qcode_col, *pos], how='left')
+    rv = roll_volume.select([qcode_col, 'avg_roll_volume'])
+    out = roll_bins.join(c, on=[qcode_col, *pos], how='left').join(rv, on=qcode_col, how='left')
 
+    target = participation_rate * pl.col('avg_roll_volume').fill_null(0.0)
     f = pl.col('volume_fraction').fill_null(0.0)
     f_sum = f.sum().over('security')
     return out.with_columns(
-        scheduled_qty=pl.when(f_sum > 0).then(target_qty * f / f_sum).otherwise(0.0)
-    ).drop('volume_fraction')
+        scheduled_qty=pl.when(f_sum > 0).then(target * f / f_sum).otherwise(0.0)
+    ).drop(['volume_fraction', 'avg_roll_volume'])
 
 
 # ── 2. Execution simulation ──────────────────────────────────────────────────────
@@ -306,48 +321,57 @@ def summarize(sim: pl.DataFrame, direction: str = 'buy') -> dict:
 def build_schedules(
     df_bins: pl.DataFrame,
     df_history: pl.DataFrame,
-    target_qty: float = 10_000,
+    participation_rate: float = 0.05,
     leakage_safe: bool = True,
     curve: pl.DataFrame | None = None,
+    roll_volume: pl.DataFrame | None = None,
     qcode_col: str = 'qcode',
     position_cols: tuple[str, ...] = ('days_until', 'bin_start_time'),
     target_col: str = 'target_date',
 ) -> pl.DataFrame:
-    """Attach ``scheduled_qty`` to every bin in `df_bins`, sourcing the volume curve from
-    `df_history` (the full roll history — usually the same `df_cs`).
+    """Attach ``scheduled_qty`` to every bin in `df_bins`. Each roll's target is
+    ``participation_rate`` of its qcode's average roll volume, sliced by the volume curve; both
+    the curve and the roll-volume average are sourced from `df_history` (the full roll history —
+    usually the same `df_cs`).
 
-      - `leakage_safe=True` (default): each roll is scheduled against a curve built only from
-        PRIOR rolls of its qcode (``historical_volume_curve(before=target_date)``) — backtest-
-        honest, so the first roll per qcode is unscheduled (no history). O(rolls) curve builds.
-      - `leakage_safe=False`: schedule every roll against one full-sample curve (`curve`, or one
-        computed from `df_history`). Quicker, but peeks at the whole sample — diagnostics only.
+      - `leakage_safe=True` (default): each roll is scheduled against a curve AND a roll-volume
+        average built only from PRIOR rolls of its qcode (``historical_volume_curve`` /
+        ``historical_roll_volume`` with ``before=target_date``) — backtest-honest, so the first
+        roll per qcode is unscheduled (no history). O(rolls) builds.
+      - `leakage_safe=False`: schedule every roll against one full-sample curve and roll volume
+        (`curve` / `roll_volume`, or ones computed from `df_history`). Quicker, but peeks at the
+        whole sample — diagnostics only.
     """
     if leakage_safe:
         keys = df_bins.select('security', qcode_col, target_col).unique()
         parts = []
         for row in keys.iter_rows(named=True):
             qc, tgt, sec = row[qcode_col], row[target_col], row['security']
+            qc_hist = df_history.filter(pl.col(qcode_col) == qc)
             hist = historical_volume_curve(
-                df_history.filter(pl.col(qcode_col) == qc), before=tgt,
-                group_col=qcode_col, position_cols=position_cols,
+                qc_hist, before=tgt, group_col=qcode_col, position_cols=position_cols,
             )
+            rv = historical_roll_volume(qc_hist, before=tgt, group_col=qcode_col, target_col=target_col)
             bins = df_bins.filter(pl.col('security') == sec)
-            parts.append(attach_volume_schedule(bins, hist, target_qty, qcode_col, position_cols))
+            parts.append(attach_volume_schedule(bins, hist, rv, participation_rate, qcode_col, position_cols))
         return pl.concat(parts) if parts else df_bins.head(0)
 
     if curve is None:
         curve = compute_volume_curve(df_history, group_col=qcode_col, position_cols=position_cols)
-    return attach_volume_schedule(df_bins, curve, target_qty, qcode_col, position_cols)
+    if roll_volume is None:
+        roll_volume = compute_roll_volume(df_history, group_col=qcode_col)
+    return attach_volume_schedule(df_bins, curve, roll_volume, participation_rate, qcode_col, position_cols)
 
 
 def run_vwap_backtest(
     df_cs: pl.DataFrame,
-    target_qty: float = 10_000,
+    participation_rate: float = 0.05,
     direction: str = 'buy',
     fill_model: str = 'queue',
-    window: int = 1,
+    window_fraction: float = 0.3,
     leakage_safe: bool = True,
     curve: pl.DataFrame | None = None,
+    roll_volume: pl.DataFrame | None = None,
     df_signals: pl.DataFrame | None = None,
     qcode_col: str = 'qcode',
     position_cols: tuple[str, ...] = ('days_until', 'bin_start_time'),
@@ -359,16 +383,20 @@ def run_vwap_backtest(
     `qcode`, `security`, `days_until`, `target_date`, the *_start quotes, volume / signed_volume,
     and `futures_price`). See ``build_schedules`` for the `leakage_safe` curve semantics.
 
-    `window` is the order survival length in bins (1 = naive single-bin; larger lets a passive
-    order rest across several bins, raising the passive-fill rate). Pass `df_signals` (carrying
-    `_tick`) to also report costs in ticks per lot (the default framework).
+    `participation_rate` sizes each roll as that fraction of its qcode's average roll volume.
+    `window_fraction` sets the per-security order survival window to that fraction of the
+    security's touch-size-to-trade-volume ratio (see ``lob_simulation.simulate_windowed``); a
+    larger window lets a passive order rest across more bins, raising the passive-fill rate. Pass
+    `df_signals` (carrying `_tick`) to also report costs in ticks per lot (the default framework).
     """
     if df_signals is not None:
         df_cs = attach_tick_sizes(df_cs, df_signals)
     scheduled = build_schedules(
-        df_cs, df_cs, target_qty, leakage_safe, curve, qcode_col, position_cols, target_col,
+        df_cs, df_cs, participation_rate, leakage_safe, curve, roll_volume,
+        qcode_col, position_cols, target_col,
     )
-    sim = simulate_windowed(scheduled, direction=direction, fill_model=fill_model, window=window)
+    sim = simulate_windowed(scheduled, direction=direction, fill_model=fill_model,
+                            window_fraction=window_fraction)
     return per_security_metrics(sim, direction), summarize(sim, direction)
 
 
@@ -505,11 +533,11 @@ def run_improved_vwap_backtest(
     df_cs: pl.DataFrame,
     predictions: pl.DataFrame,
     df_signals: pl.DataFrame,
-    target_qty: float = 10_000,
+    participation_rate: float = 0.05,
     direction: str = 'buy',
     fill_model: str = 'hilo',
     ticks: int = 2,
-    window: int = 1,
+    window_fraction: float = 0.3,
     leakage_safe: bool = True,
     framework: str = 'ticks',
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -526,9 +554,11 @@ def run_improved_vwap_backtest(
     (positive = overlay cheaper); per-strategy cost columns are reported in BOTH units so the
     other framework is always one subtraction away.
 
-    `window` is the order survival length in bins, applied identically to both strategies so the
-    comparison stays like-for-like (1 = naive single-bin; larger lets resting orders fill across
-    more bins).
+    `participation_rate` sizes each roll as that fraction of its qcode's average roll volume.
+    `window_fraction` sets each security's order survival window to that fraction of its
+    touch-size-to-trade-volume ratio (see ``lob_simulation.simulate_windowed``); it is computed
+    off the shared schedule, so the same per-security window applies to both strategies and the
+    comparison stays like-for-like.
 
     Returns (summary, per_security):
       - `summary`: two rows (baseline_vwap, ordered_logit_vwap) of portfolio metrics + the
@@ -553,11 +583,12 @@ def run_improved_vwap_backtest(
         )
     )
 
-    scheduled = build_schedules(df_use, df_cs, target_qty, leakage_safe=leakage_safe)
+    scheduled = build_schedules(df_use, df_cs, participation_rate, leakage_safe=leakage_safe)
 
-    base_sim = simulate_windowed(scheduled, direction=direction, fill_model=fill_model, window=window)
+    base_sim = simulate_windowed(scheduled, direction=direction, fill_model=fill_model,
+                                 window_fraction=window_fraction)
     impr_sim = simulate_windowed(scheduled, direction=direction, fill_model=fill_model,
-                                 window=window, ticks=ticks, pred_col='pred')
+                                 window_fraction=window_fraction, ticks=ticks, pred_col='pred')
 
     base_sum = {'strategy': 'baseline_vwap', **summarize(base_sim, direction)}
     impr_sum = {'strategy': 'ordered_logit_vwap', **summarize(impr_sim, direction)}
@@ -570,8 +601,9 @@ def run_improved_vwap_backtest(
     )
 
     cost_cols = ['cost_vs_vwap_ticks', 'cost_vs_vwap_bp', 'cost_vs_mid_ticks', 'cost_vs_mid_bp']
-    # `total_qty` (lots executed per roll, = target_qty by conservation) is the correct per-lot
-    # weight for aggregating per-roll improvement across rolls — it is what `summarize` pools over.
+    # `total_qty` (lots executed per roll, = the roll's participation-rate target by conservation)
+    # is the correct per-lot weight for aggregating per-roll improvement across rolls — it is what
+    # `summarize` pools over. With a participation rate this varies by roll (larger rolls weigh more).
     base_ps = per_security_metrics(base_sim, direction).select(
         'security', 'qcode', 'total_qty', 'passive_rate', 'exec_avg_price', *cost_cols,
     )
