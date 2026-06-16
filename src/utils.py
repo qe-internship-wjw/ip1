@@ -78,25 +78,14 @@ def read_table(session: Session, database: str, schema: str, table: str, columns
 
 # ── Contract ticker parsing ─────────────────────────────────────────────────────
 
-# Standard futures month codes -> calendar month number.
-FUTURES_MONTH_CODES = {
-    "F": 1, "G": 2, "H": 3, "J": 4, "K": 5, "M": 6,
-    "N": 7, "Q": 8, "U": 9, "V": 10, "X": 11, "Z": 12,
-}
-_MC = "".join(FUTURES_MONTH_CODES)  # "FGHJKMNQUVXZ"
+# Standard futures month codes
+_MC = "FGHJKMNQUVXZ"
 
 # Naming conventions (whitespace-separated yellow key suffix):
-#   Future        : BBG_CODE + YY + MONTH_CODE                      e.g. "ABC2024M Comdty"
-#   Calendar spread: BBG_CODE + YY + MC + "/" + YY + MC             e.g. "ABC2024M/2024N Comdty"
+#   Future        : BBG_CODE + YY + MONTH_CODE                      e.g. "AB2024M Comdty"
+#   Calendar spread: BBG_CODE + YY + MC + "/" + YY + MC             e.g. "AB2024M/2024N Comdty"
 _FUTURE_RE = rf"^(?P<bbg>[^/]*?)(?P<yy>\d{{4}})(?P<mc>[{_MC}])\s(?P<yk>\S+)$"
 _SPREAD_RE = rf"^(?P<bbg>[^/]*?)(?P<ny>\d{{4}})(?P<nmc>[{_MC}])/(?P<fy>\d{{4}})(?P<fmc>[{_MC}])\s(?P<yk>\S+)$"
-
-
-def _expiry_key(year: pl.Expr, month_code: pl.Expr) -> pl.Expr:
-    """Chronologically-sortable integer key (YYYYMM) from a 4-digit year and a month code."""
-    year = year.cast(pl.Int32)
-    month = month_code.replace_strict(FUTURES_MONTH_CODES, return_dtype=pl.Int32)
-    return year * 100 + month
 
 
 def _build_identifier(bbg: pl.Expr, yy: pl.Expr, mc: pl.Expr, yk: pl.Expr) -> pl.Expr:
@@ -123,32 +112,18 @@ def parse_security(df: pl.DataFrame, col: str = "security") -> pl.DataFrame:
     sp_fmc = pl.col("_sp").struct.field("fmc").fill_null("U")
     sp_yk = pl.col("_sp").struct.field("yk").fill_null("")
 
-    fut_yy = pl.col("_fut").struct.field("yy").fill_null("2000")
-    fut_mc = pl.col("_fut").struct.field("mc").fill_null("U")
-
     # Step 3: Derive all parsed fields safely.
     df = df.with_columns(
         near_identifier=pl.when(pl.col("is_spread"))
             .then(_build_identifier(sp_bbg, sp_ny, sp_nmc, sp_yk))
             .otherwise(pl.col(col)),
-            
+
         far_identifier=pl.when(pl.col("is_spread"))
             .then(_build_identifier(sp_bbg, sp_fy, sp_fmc, sp_yk))
             .otherwise(None),
-            
-        near_expiry_key=pl.when(pl.col("is_spread"))
-            .then(_expiry_key(sp_ny, sp_nmc))
-            .otherwise(_expiry_key(fut_yy, fut_mc)),
-            
-        far_expiry_key=pl.when(pl.col("is_spread"))
-            .then(_expiry_key(sp_fy, sp_fmc))
-            .otherwise(None),
     )
 
-    # Step 4: Derive meta_key, then drop the temporary struct columns.
-    return df.with_columns(
-        meta_key=pl.col("near_identifier"),
-    ).drop(["_fut", "_sp"])
+    return df.drop(["_fut", "_sp"])
 
 
 # ── Roll-period (business-day) math ─────────────────────────────────────────────
@@ -179,55 +154,40 @@ def build_contract_calendar(
     """Build a per-future roll calendar from SECURITY_META.
 
     SECURITY_META contains only individual futures. For each future we:
-      1. parse its ticker (bbg / year / month / yellow key, expiry sort key),
-      2. attach DELIVERY at the product level (bbg_code, yellow_key) from QCODE_MAPPING,
-         since delivery is a per-product convention and many near/previous contracts never
-         appear standalone in QCODE_MAPPING,
+      1. parse its ticker to extract bbg_code,
+      2. attach DELIVERY from QCODE_MAPPING on bbg_code (unique per product),
       3. pick the target date (LAST_TRADE_DATE for 'Cash', FIRST_NOTICE_DATE for 'Phys'),
       4. compute the contract's own 10-business-day roll window, and
       5. attach the immediately-previous chronological contract's roll window (per product).
 
     Returns one row per future keyed by `security`, with columns:
-      security, expiry_key, delivery, target_date,
+      security, delivery, target_date,
       roll_start, roll_end, prev_roll_start, prev_roll_end.
     """
-    # Product-level delivery convention.
-    delivery_map = (
-        qcode_mapping.select("bbg_code", "yellow_key", "delivery")
-        .drop_nulls("delivery")
-        .unique()
-    )
+    delivery_map = qcode_mapping.select("bbg_code", "delivery").unique()
 
-    # Parse the (futures-only) tickers, then split off bbg / yellow key for the join.
     cal = parse_security(security_meta, col="security").with_columns(
-        pl.col("security").str.extract_groups(_FUTURE_RE).alias("_g"),
+        bbg_code=pl.col("security").str.extract_groups(_FUTURE_RE).struct["bbg"],
     )
-    cal = cal.with_columns(
-        bbg_code=pl.col("_g").struct["bbg"],
-        yellow_key=pl.col("_g").struct["yk"],
-        expiry_key=pl.col("near_expiry_key"),
-    ).drop("_g")
 
-    cal = cal.join(delivery_map, on=["bbg_code", "yellow_key"], how="left")
+    cal = cal.join(delivery_map, on="bbg_code", how="left")
 
-    # Target date per the delivery convention.
     cal = cal.with_columns(
         target_date=pl.when(pl.col("delivery") == "Cash")
         .then(pl.col("last_trade_date"))
-        .otherwise(pl.col("first_notice_date"))  # 'Phys' (and any non-Cash) -> first notice
+        .otherwise(pl.col("first_notice_date"))
         .cast(pl.Date),
     )
 
     cal = add_roll_window(cal, "target_date", roll_days=roll_days)
 
-    # Previous chronological contract's roll window, within each product.
-    cal = cal.sort(["bbg_code", "yellow_key", "expiry_key"]).with_columns(
-        prev_roll_start=pl.col("roll_start").shift(1).over(["bbg_code", "yellow_key"]),
-        prev_roll_end=pl.col("roll_end").shift(1).over(["bbg_code", "yellow_key"]),
+    cal = cal.sort(["bbg_code", "target_date"]).with_columns(
+        prev_roll_start=pl.col("roll_start").shift(1).over("bbg_code"),
+        prev_roll_end=pl.col("roll_end").shift(1).over("bbg_code"),
     )
 
     return cal.select(
-        "security", "expiry_key", "delivery", "target_date",
+        "security", "delivery", "target_date",
         "roll_start", "roll_end", "prev_roll_start", "prev_roll_end",
     )
 
@@ -244,6 +204,7 @@ def add_microstructure_signals(
     time_col: str = "bin_start_time",
     date_col: str = "date",
     drop_lag_nulls: bool = True,
+    df_fut: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Compute the order-book / flow signals from §3 of the research plan.
 
@@ -301,6 +262,26 @@ def add_microstructure_signals(
         .when(ask < prev_ask).then(ask_sz)
         .otherwise(-prev_ask_sz),
     )
+
+    if df_fut is not None:
+        df_fut_avg = (
+            df_fut
+            .with_columns(mid_price=pl.mean_horizontal(['bid_start', 'ask_start']))
+            .group_by([security_col, date_col])
+            .agg(futures_price=pl.col('mid_price').mean())
+        )
+        df = df.sort(date_col)
+        df_fut_avg = df_fut_avg.sort(date_col)
+        df = df.join_asof(
+            df_fut_avg,
+            on=date_col,
+            by_left='near_identifier',
+            by_right=security_col,
+            strategy='backward',
+            allow_exact_matches=False,
+        )
+    elif 'futures_price' not in df.columns:
+        df = df.with_columns(futures_price=pl.lit(None, dtype=pl.Float64))
 
     df = df.with_columns(
         delta_p_bp=pl.col('delta_p') * 10000 / pl.col('futures_price')
@@ -392,11 +373,3 @@ def ljungbox_by_security(
             rows.append(row)
 
     return pl.DataFrame(rows)
-
-
-# ── Regression diagnostics (Research Plan §5.2 / §5.3) ──────────────────────────
-
-def newey_west_maxlags(n_obs: int) -> int:
-    """Newey-West HAC lag-truncation parameter, m = floor(4 * (T/100) ** (2/9)),
-    the standard asymptotic data-dependent rule-of-thumb (T = number of observations)."""
-    return int(np.floor(4 * (n_obs / 100) ** (2 / 9)))
