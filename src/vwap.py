@@ -384,7 +384,7 @@ def simulate_improved_vwap(
     tick_col: str = 'tick',
     pred_col: str = 'pred',
     ticks: int = 2,
-    queue_depth_levels: float = 2.0,
+    queue_depth_levels: float = 1.7,
     high_col: str = 'high',
     low_col: str = 'low',
 ) -> pl.DataFrame:
@@ -534,20 +534,27 @@ def _sim_session(sched, opp, tp, ts, cp, deep, ext, pred,
         # 2. Overlay action on the start-of-bin prediction.
         p = pred[t]
         if p == adverse:
-            # Price about to move against us: cross this bin's schedule AND every resting
-            # order immediately at the touch-cross price.
-            tot = sched[t] + sum(o[2] for o in active)
-            if tot > 0:
-                aq[t] += tot; ap[t] = cp[t]
+            # Price about to move against us: cross every resting order immediately at this
+            # bin's touch-cross price, but attribute each order's remainder to ITS OWNER bin
+            # (the bin that placed it) -- not to the current bin.
+            for o in active:
+                if o[2] > 0:
+                    aq[o[0]] += o[2]; ap[o[0]] = cp[t]; o[2] = 0.0
+            # The current bin's own schedule is crossed aggressively here and credited to t.
+            if sched[t] > 0:
+                aq[t] += sched[t]; ap[t] = cp[t]
             active = []
         elif p == favourable:
-            # Price about to move our way: cancel resting orders and re-place them merged with
-            # this bin's schedule, deeper, on THIS bin's (fresh) window.
-            merged = sum(o[2] for o in active)
-            active = []
-            qty = sched[t] + merged
-            if qty > 0:
-                active.append([t, deep[t], qty, qdepth * ts[t], t + W, True])
+            # Price about to move our way: re-place the resting orders deeper on a fresh window,
+            # updating them IN-PLACE so each keeps its original owner index (preserving history).
+            for o in active:
+                o[1] = deep[t]                     # deeper limit
+                o[3] = qdepth * ts[t]              # reset & refresh the queue ahead
+                o[4] = t + W                       # refresh the survival expiry window
+                pp[o[0]] = deep[t]                 # update the recorded passive price trace
+            # This bin's own schedule joins as a fresh individual order owned by t.
+            if sched[t] > 0:
+                active.append([t, deep[t], sched[t], qdepth * ts[t], t + W, True])
                 pp[t] = deep[t]
         else:
             if sched[t] > 0:                       # flat / no prediction -> rest at the touch
@@ -559,7 +566,12 @@ def _sim_session(sched, opp, tp, ts, cp, deep, ext, pred,
         for o in active:
             if o[2] <= 0 or not reached(o[1], t):
                 continue
-            if queue_model:
+            walk_through = (ext[t] < o[1]) if is_buy else (ext[t] > o[1])
+            if has_range and walk_through:
+                # The market traded ENTIRELY through our resting limit (a strict walk-through):
+                # the order fills 100% passively at its limit regardless of queue position.
+                pf[o[0]] += o[2]; pp[o[0]] = o[1]; o[2] = 0.0
+            elif queue_model:                            # touched our limit exactly -> queue race
                 flow = opp[t]
                 eat = o[3] if o[3] < flow else flow      # opposing flow first clears the queue
                 o[3] -= eat; flow -= eat
