@@ -32,7 +32,7 @@ import polars as pl
 # list as notebook 02b.
 TICK_CONSTRAINED_BBG = ['OE', 'DU', 'IK', 'RX', 'UB', 'OAT'
                         'XP', 'QZ', 'VG', 
-                        # 'FV', 'TU',
+                        'FV', 'TU',
                         ]
 
 # Ordered-logit target categories and explanatory variables (OFI omitted: NOI = OFI - STV

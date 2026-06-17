@@ -40,7 +40,7 @@ BINNED_COLS = [
     'QCODE', 'SECURITY', 'BIN_START_TIME', 'PUBLICATION_DATE',
     'BID_SIZE_START', 'ASK_SIZE_START', 'BID_START', 'ASK_START',
     'VOLUME', 'SIGNED_VOLUME', 'TWA_ASK_SIZE', 'TWA_BID_SIZE',
-    'HIGH', 'LOW',
+    'HIGH', 'LOW', 'TRADE_COUNT',
 ]
 QCODE_COLS = ['QCODE', 'BBG_CODE', 'YELLOW_KEY', 'DELIVERY', 'IS_CONVENTION_BUY_NEAR']
 SEC_META_COLS = ['SECURITY', 'LAST_TRADE_DATE', 'FIRST_NOTICE_DATE']
@@ -322,9 +322,12 @@ def add_microstructure_signals(
 # obi - get their own scale normalisation in the transform stage).
 SIGNAL_NORM_COLS = ['ofi', 'stv', 'noi']
 
-# Time-of-roll volatility: a 3-hour centred window on 5-minute bins.
-TOR_VOL_WIN = 36
-TOR_VOL_MIN_SAMPLES = 18
+# Valid choices for the `normalization` parameter of generate_signals.
+NORMALIZATIONS = ("time_of_roll", "rolling")
+
+# Naive rolling z-score: trailing window length (in bins) within each (security, date) session.
+ROLL_WIN = 60
+ROLL_MIN_SAMPLES = 2
 
 
 def _apply_signal_transforms(
@@ -368,16 +371,13 @@ def _apply_signal_transforms(
 
 def _normalize_time_of_roll(
     df_signals: pl.DataFrame,
+    train_end: date,
     signal_cols: list[str] = SIGNAL_NORM_COLS,
-    vol_win: int = TOR_VOL_WIN,
-    min_samples: int = TOR_VOL_MIN_SAMPLES,
     qcode_col: str = 'qcode',
-    train_end: date | None = None,
 ) -> pl.DataFrame:
-    """Time-of-roll normalisation (two modes, selected by ``train_end``).
+    """Time-of-roll normalisation against a fixed train-set volatility profile.
 
-    **Fixed-train-set mode** (``train_end`` provided, recommended):
-      Scales each signal by a volatility profile indexed by (qcode, days_until) only:
+    Scales each signal by a volatility profile indexed by (qcode, days_until) only:
 
       1. Intraday volatility per session: for each (qcode, days_until, security, date) session
          compute the std of the signal across all its intraday bins — each day is the window.
@@ -385,112 +385,129 @@ def _normalize_time_of_roll(
          train-period sessions.  Single-bin sessions (std = null) are excluded from the mean.
       3. Scale: signal / mean_intraday_vol.
 
-      Look-forward leakage within the train set is permitted. The fixed profile is applied to
-      all rows (train + val + test), so nothing leaks across the train boundary.
-
-    **Expanding mode** (``train_end=None``, original leakage-free behaviour):
-      Each signal is divided by a volatility estimated from PAST rolls of the same ``qcode``:
-
-      1. Local intraday vol: centred ``vol_win``-bin rolling std within each (security, date)
-         session — never crosses a day boundary.
-      2. Expanding profile: mean of that local vol across all strictly prior rolls, ordered by
-         ``target_date``.  The earliest roll of each ``qcode`` (no history) yields null.
-      3. Scale-only: signal / profile-vol.
-
-    In both modes bins with a degenerate (≈0) profile vol yield null and are dropped downstream.
+    The profile is estimated only on rolls with ``target_date <= train_end`` and then applied to
+    all rows (train + val + test), so nothing leaks across the train boundary even though
+    look-forward within the train set is permitted. Bins with a degenerate (≈0) profile vol yield
+    null and are dropped downstream.
     """
     df = df_signals.sort(['security', 'date', 'bin_start_time'])
-    stage = [qcode_col, 'days_until', 'bin_start_time']
+    train_df = df.filter(pl.col('target_date').cast(pl.Date) <= pl.lit(train_end))
 
-    if train_end is not None:
-        train_df = df.filter(pl.col('target_date').cast(pl.Date) <= pl.lit(train_end))
+    # Step 1. Intraday volatility per session: std of each signal across all bins within
+    # each (qcode, days_until, security, date) session.  Each day is the window.
+    # std() returns null for single-bin sessions; those are excluded from the mean below.
+    session_vol = (
+        train_df
+        .group_by([qcode_col, 'days_until', 'security', 'date'])
+        .agg([pl.col(c).std().alias(f'_sess_std_{c}') for c in signal_cols])
+    )
 
-        # Step 1. Intraday volatility per session: std of each signal across all bins within
-        # each (qcode, days_until, security, date) session.  Each day is the window.
-        # std() returns null for single-bin sessions; those are excluded from the mean below.
-        session_vol = (
-            train_df
-            .group_by([qcode_col, 'days_until', 'security', 'date'])
-            .agg([pl.col(c).std().alias(f'_sess_std_{c}') for c in signal_cols])
-        )
+    # Step 2. Mean of that intraday vol per (qcode, days_until) across all train sessions.
+    profile = (
+        session_vol
+        .group_by([qcode_col, 'days_until'])
+        .agg([pl.col(f'_sess_std_{c}').mean().alias(f'_torstd_{c}') for c in signal_cols])
+    )
 
-        # Step 2. Mean of that intraday vol per (qcode, days_until) across all train sessions.
-        profile = (
-            session_vol
-            .group_by([qcode_col, 'days_until'])
-            .agg([pl.col(f'_sess_std_{c}').mean().alias(f'_torstd_{c}') for c in signal_cols])
-        )
+    df = df.join(profile, on=[qcode_col, 'days_until'], how='left')
 
-        df = df.join(profile, on=[qcode_col, 'days_until'], how='left')
-
-        # Step 3. Scale by mean intraday volatility.
-        df = df.with_columns([
-            pl.when(pl.col(f'_torstd_{c}') > 1e-12)
-            .then(pl.col(c) / pl.col(f'_torstd_{c}'))
-            .otherwise(None)
-            .alias(c)
-            for c in signal_cols
-        ])
-        drop_cols = [f'_torstd_{c}' for c in signal_cols]
-
-    else:
-        # Expanding mode: within-session local vol + expanding mean over prior rolls.
-        df = df.with_columns([
-            pl.col(c)
-            .rolling_std(window_size=vol_win, min_samples=min_samples, center=True)
-            .over(SESSION)
-            .alias(f'_locvol_{c}')
-            for c in signal_cols
-        ])
-
-        df = df.sort([*stage, 'target_date', 'security'])
-        tor_exprs = []
-        for c in signal_cols:
-            lv = pl.col(f'_locvol_{c}')
-            present = lv.is_not_null().cast(pl.Int64)
-            prior_sum = lv.fill_null(0).cum_sum().over(stage) - lv.fill_null(0)
-            prior_cnt = present.cum_sum().over(stage) - present
-            # Guard prior_cnt == 0: 0/0 yields NaN (not null), slipping past the > 1e-12 guard.
-            tor_exprs.append(
-                pl.when(prior_cnt > 0).then(prior_sum / prior_cnt).otherwise(None).alias(f'_torvol_{c}')
-            )
-        df = df.with_columns(tor_exprs)
-
-        df = df.with_columns([
-            pl.when(pl.col(f'_torvol_{c}') > 1e-12)
-            .then(pl.col(c) / pl.col(f'_torvol_{c}'))
-            .otherwise(None)
-            .alias(c)
-            for c in signal_cols
-        ])
-        drop_cols = [f'_locvol_{c}' for c in signal_cols] + [f'_torvol_{c}' for c in signal_cols]
+    # Step 3. Scale by mean intraday volatility.
+    df = df.with_columns([
+        pl.when(pl.col(f'_torstd_{c}') > 1e-12)
+        .then(pl.col(c) / pl.col(f'_torstd_{c}'))
+        .otherwise(None)
+        .alias(c)
+        for c in signal_cols
+    ])
+    drop_cols = [f'_torstd_{c}' for c in signal_cols]
 
     return df.drop(drop_cols).sort(['security', 'date', 'bin_start_time'])
+
+
+def _normalize_rolling(
+    df_signals: pl.DataFrame,
+    signal_cols: list[str] = SIGNAL_NORM_COLS,
+    roll_win: int = ROLL_WIN,
+    min_samples: int = ROLL_MIN_SAMPLES,
+) -> pl.DataFrame:
+    """Naive intraday rolling z-score normalisation (leakage-free by construction).
+
+    Each signal is replaced by its rolling z-score within its own (security, date) session:
+
+      1. mu_c, sd_c : trailing ``roll_win``-bin rolling mean / std within SESSION,
+      2. a degenerate (≈0) session std is replaced by the mean of all non-degenerate stds so the
+         z-score does not blow up,
+      3. z = (signal - mu_c) / sd_c.
+
+    Because every window only ever looks back within the same session, no statistic crosses a day
+    boundary or the train/val/test split — so, unlike time-of-roll, this needs no ``train_end``.
+    """
+    df = df_signals.sort(['security', 'date', 'bin_start_time'])
+
+    df = df.with_columns(
+        [
+            pl.col(c).rolling_mean(window_size=roll_win, min_samples=min_samples)
+            .over(SESSION).alias(f'_mu_{c}')
+            for c in signal_cols
+        ]
+        + [
+            pl.col(c).rolling_std(window_size=roll_win, min_samples=min_samples)
+            .over(SESSION).alias(f'_sd_{c}')
+            for c in signal_cols
+        ]
+    )
+
+    # Replace a degenerate (≈0) std by the mean of the non-degenerate stds (keeps the z-score finite).
+    df = df.with_columns([
+        pl.when(pl.col(f'_sd_{c}') < 1e-6)
+        .then(pl.col(f'_sd_{c}').filter(pl.col(f'_sd_{c}') >= 1e-6).mean())
+        .otherwise(pl.col(f'_sd_{c}'))
+        .alias(f'_sd_{c}')
+        for c in signal_cols
+    ])
+
+    df = df.with_columns([
+        ((pl.col(c) - pl.col(f'_mu_{c}')) / pl.col(f'_sd_{c}')).fill_nan(None).alias(c)
+        for c in signal_cols
+    ])
+
+    drop_cols = [f'_mu_{c}' for c in signal_cols] + [f'_sd_{c}' for c in signal_cols]
+    return df.drop(drop_cols)
 
 
 def generate_signals(
     df_cs: pl.DataFrame,
     df_fut: pl.DataFrame | None = None,
     obi_method: str = "end_of_bin",
-    train_end: date | None = None,
+    normalization: str = "time_of_roll",
+    train_end: date = TRAIN_END,
 ) -> pl.DataFrame:
-    """Microstructure signals (partitioned by SESSION [security, date]) + time-of-roll normalisation.
+    """Microstructure signals (partitioned by SESSION [security, date]) + flow-signal normalisation.
 
     Normalised values overwrite the raw columns so downstream sections use them automatically:
 
       1. delta_p in ticks (per-BBG_CODE tick size, kept as `_tick`),
       2. OBI as fraction of total quoted size at the touch (denominator set by `obi_method`),
-      3-5. OFI / STV / NOI divided by a TOR volatility profile (see ``_normalize_time_of_roll``);
-           requires `qcode`, `days_until`, `target_date`.
+      3-5. OFI / STV / NOI normalised by the chosen `normalization` scheme.
 
-    Pass ``train_end`` to use the full-train-set profile (recommended); leave ``None`` for the
-    original expanding (prior-rolls-only) mode.  Use ``TRAIN_END`` for the standard 2021-23
-    static split, or ``w.train_end`` inside a walk-forward loop.
+    `normalization` selects how OFI / STV / NOI are scaled:
+      "time_of_roll" (default) : divide by a fixed train-set volatility profile indexed by
+                                 (qcode, days_until) — see ``_normalize_time_of_roll``. Requires
+                                 `qcode`, `days_until`, `target_date`. ``train_end`` bounds the
+                                 train partition the profile is estimated on (defaults to the
+                                 standard 2021-23 ``TRAIN_END``; pass ``w.train_end`` inside a
+                                 walk-forward loop).
+      "rolling"                : naive trailing rolling z-score within each (security, date)
+                                 session — see ``_normalize_rolling``. ``train_end`` is unused.
     """
-    return _normalize_time_of_roll(
-        _apply_signal_transforms(df_cs, df_fut=df_fut, obi_method=obi_method),
-        train_end=train_end,
-    )
+    if normalization not in NORMALIZATIONS:
+        raise ValueError(f"normalization must be one of {NORMALIZATIONS}, got {normalization!r}")
+
+    df_signals = _apply_signal_transforms(df_cs, df_fut=df_fut, obi_method=obi_method)
+
+    if normalization == "rolling":
+        return _normalize_rolling(df_signals)
+    return _normalize_time_of_roll(df_signals, train_end=train_end)
 
 
 # ── 6. Outright-futures signals + buy/sell-leg augmentation ─────────────────────
@@ -498,7 +515,8 @@ def generate_signals(
 def generate_futures_signals(
     df: pl.DataFrame,
     obi_method: str = "end_of_bin",
-    train_end: date | None = None,
+    normalization: str = "time_of_roll",
+    train_end: date = TRAIN_END,
 ) -> pl.DataFrame:
     """Compute the normalised OBI / STV signals for the OUTRIGHT FUTURES.
 
@@ -513,7 +531,9 @@ def generate_futures_signals(
     df_fut = df_fut.with_columns(
         days_until=pl.business_day_count(pl.col('date'), pl.col('target_date')),
     )
-    return generate_signals(df_fut, obi_method=obi_method, train_end=train_end)
+    return generate_signals(
+        df_fut, obi_method=obi_method, normalization=normalization, train_end=train_end,
+    )
 
 
 def attach_outright_signals(
@@ -569,7 +589,8 @@ def attach_leg_signals(
     df_combined: pl.DataFrame,
     signal_cols: tuple[str, ...] = ('obi', 'stv'),
     obi_method: str = "end_of_bin",
-    train_end: date | None = None,
+    normalization: str = "time_of_roll",
+    train_end: date = TRAIN_END,
 ) -> pl.DataFrame:
     """Add the buy-/sell-leg outright `signal_cols` to an already-built spread-signals frame.
 
@@ -580,7 +601,9 @@ def attach_leg_signals(
     """
     return attach_outright_signals(
         df_signals,
-        generate_futures_signals(df_combined, obi_method=obi_method, train_end=train_end),
+        generate_futures_signals(
+            df_combined, obi_method=obi_method, normalization=normalization, train_end=train_end,
+        ),
         signal_cols=signal_cols,
     )
 
