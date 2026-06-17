@@ -377,18 +377,17 @@ def predict_target_bins(
     min_val_rows: int = 50,
     verbose: bool = True,
 ) -> pl.DataFrame | None:
-    """Walk-forward OOS predictions of the next bin's move, aligned to each TARGET bin.
+    """Walk-forward OOS predictions aligned to each bin.
 
     For each window: fit on train, tune the threshold on val, then predict ``delta_p_fwd`` for
-    every test bin with non-null features. The prediction made at bin t is about bin t+1, so it
-    is shifted one step forward WITHIN each [security, date] session to land on the target bin it
-    describes (``pred``). This is exactly the information an executor has at the *start* of the
-    target bin (the previous bin's features are already known), so there is no look-ahead.
+    every test bin with non-null features. Because ``delta_p_fwd`` is already forward-shifted,
+    the prediction at bin t directly corresponds to the move starting at bin t+1 — no additional
+    shift is applied.
 
     For each window the -2 and +2 thresholds are tuned independently on val by F-beta (``beta``).
-    Returns one row per OOS target bin: ``security, date, bin_start_time, pred, pred_made,
-    window, thr_down, thr_up`` (``pred`` is null on each session's first bin). None if no window
-    produced predictions. Consumed by ``src.vwap.run_improved_vwap_backtest``.
+    Returns one row per OOS bin with valid features: ``security, date, bin_start_time, pred,
+    pred_made, window, thr_down, thr_up``. None if no window produced predictions. Consumed by
+    ``src.vwap.run_improved_vwap_backtest``.
     """
     out = []
     for w in windows:
@@ -432,7 +431,7 @@ def predict_target_bins(
         pred_made = assign_classes(probs, thr_down, thr_up)
         test_valid = test_valid.with_columns(pred_made=pl.Series('pred_made', pred_made))
 
-        # 3. Join the predictions back to the continuous timeline, THEN shift chronologically
+        # 3. Join the predictions back to the continuous timeline
         test_shifted = (
             test_full.join(
                 test_valid.select(['security', 'date', 'bin_start_time', 'pred_made']),
@@ -440,13 +439,11 @@ def predict_target_bins(
                 how='left'
             )
             .with_columns(
-                pred=pl.col('pred_made').shift(1).over(['security', 'date']),
+                pred=pl.col('pred_made').fill_null(0),
                 window=pl.lit(w.index),
                 thr_down=pl.lit(float(thr_down)),
                 thr_up=pl.lit(float(thr_up)),
             )
-            # Drop rows where no prediction can be applied to the execution engine
-            .drop_nulls('pred')
         )
 
         out.append(test_shifted.select('security', 'date', 'bin_start_time', 'pred', 'pred_made',

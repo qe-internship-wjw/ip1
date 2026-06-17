@@ -153,7 +153,7 @@ def apply_roll_volume_filter(
 ) -> pl.DataFrame:
     """Tag spread bins with `is_roll_period` without filtering.
 
-    Roll period: daily volume >= `threshold` × the same security's max daily volume.
+    Roll period: daily volume >= `threshold` x the same security's max daily volume.
     The column is retained for downstream use; rows outside the volume roll are not
     dropped because roll timing can differ across contracts sharing the same qcode.
     """
