@@ -30,7 +30,10 @@ import polars as pl
 # Tick-constrained curve groups: trade on a near-discrete price grid, so delta_p is cleaned
 # to the ordered set {-2, 0, +2} and modelled with the class-weighted ordered logit. Same
 # list as notebook 02b.
-TICK_CONSTRAINED_BBG = ['OE', 'XP', 'DU', 'IK', 'RX', 'QZ', 'FV', 'TU', 'VG', 'UB', 'OAT']
+TICK_CONSTRAINED_BBG = ['OE', 'DU', 'IK', 'RX', 'UB', 'OAT'
+                        'XP', 'QZ', 'VG', 
+                        # 'FV', 'TU',
+                        ]
 
 # Ordered-logit target categories and explanatory variables (OFI omitted: NOI = OFI - STV
 # makes the three collinear — see Research Plan §5.2).

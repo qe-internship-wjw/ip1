@@ -18,6 +18,8 @@ Stages (each also callable individually for inspection / iteration):
      attach_outright_signals    buy-/sell-leg outright OBI/STV joined onto each spread bin
 """
 
+from datetime import date
+
 import polars as pl
 from snowflake.snowpark.session import Session
 
@@ -44,16 +46,17 @@ QCODE_COLS = ['QCODE', 'BBG_CODE', 'YELLOW_KEY', 'DELIVERY', 'IS_CONVENTION_BUY_
 SEC_META_COLS = ['SECURITY', 'LAST_TRADE_DATE', 'FIRST_NOTICE_DATE']
 
 # Data subset: trading years 2021-2025, feeding the chronological OOS split downstream.
-YEARS = [2021, 2022, 2023, 2024, 2025]
+YEARS = [2020, 2021, 2022, 2023, 2024, 2025]
 
 # Chronological out-of-sample split (by trading-data year). Defined here so every
 # downstream transform references the SAME train partition - in particular the
 # within-train z-score padding in the normalisation step, which must not pull
 # statistics from validation/test rows.
-TRAIN_YEARS = [2021, 2022, 2023]
+TRAIN_YEARS = [2020, 2021, 2022, 2023]
 VAL_YEARS = [2024]
 TEST_YEARS = [2025]
 YEAR_LABEL = {'train': '2021-2023', 'val': '2024', 'test': '2025'}
+TRAIN_END = date(max(TRAIN_YEARS), 12, 31)  # inclusive upper bound of the static train partition
 
 ROLL_DAYS = 10              # business days in each contract's rough roll window
 ROLL_VOLUME_THRESHOLD = 0.25  # percentage of max volume to be considered roll
@@ -319,9 +322,9 @@ def add_microstructure_signals(
 # obi - get their own scale normalisation in the transform stage).
 SIGNAL_NORM_COLS = ['ofi', 'stv', 'noi']
 
-# Time-of-roll volatility: a 1-hour centred window on 5-minute bins.
-TOR_VOL_WIN = 12
-TOR_VOL_MIN_SAMPLES = 6
+# Time-of-roll volatility: a 3-hour centred window on 5-minute bins.
+TOR_VOL_WIN = 36
+TOR_VOL_MIN_SAMPLES = 18
 
 
 def _apply_signal_transforms(
@@ -369,70 +372,107 @@ def _normalize_time_of_roll(
     vol_win: int = TOR_VOL_WIN,
     min_samples: int = TOR_VOL_MIN_SAMPLES,
     qcode_col: str = 'qcode',
+    train_end: date | None = None,
 ) -> pl.DataFrame:
-    """Time-of-roll volatility normalisation (leakage-free, no start-of-session noise blow-up).
+    """Time-of-roll normalisation (two modes, selected by ``train_end``).
 
-    Each signal is divided by a volatility that depends only on the *stage of the roll*
-    - (`days_until`, `bin_start_time`) - estimated from PAST rolls of the same ``qcode``:
+    **Fixed-train-set mode** (``train_end`` provided, recommended):
+      Scales each signal by a volatility profile indexed by (qcode, days_until) only:
 
-      1. Local intraday vol: within each [security, date] session, the centred `vol_win`-bin
-         (1-hour) rolling std of the signal. Centring uses neighbouring bins of the *same*
-         completed roll, so it is look-ahead only within already-historical rolls.
-      2. Time-of-roll profile: for each (qcode, days_until, bin_start_time) stage, the mean of
-         that local vol across all STRICTLY PRIOR rolls (securities ordered by `target_date`,
-         current roll excluded). A roll is normalised purely by rolls that finished before it,
-         so there is no train/val/test leakage and no train-restricted fallback.
-      3. Normalise: signal / profile-vol (scale only - the flow signals are ~zero-mean).
+      1. Intraday volatility per session: for each (qcode, days_until, security, date) session
+         compute the std of the signal across all its intraday bins — each day is the window.
+      2. Mean intraday vol per (qcode, days_until): average those per-session stds across all
+         train-period sessions.  Single-bin sessions (std = null) are excluded from the mean.
+      3. Scale: signal / mean_intraday_vol.
 
-    The earliest roll of each ``qcode`` (no prior history) and stages with a degenerate profile
-    vol yield null - dropped downstream rather than imputed, by design.
+      Look-forward leakage within the train set is permitted. The fixed profile is applied to
+      all rows (train + val + test), so nothing leaks across the train boundary.
+
+    **Expanding mode** (``train_end=None``, original leakage-free behaviour):
+      Each signal is divided by a volatility estimated from PAST rolls of the same ``qcode``:
+
+      1. Local intraday vol: centred ``vol_win``-bin rolling std within each (security, date)
+         session — never crosses a day boundary.
+      2. Expanding profile: mean of that local vol across all strictly prior rolls, ordered by
+         ``target_date``.  The earliest roll of each ``qcode`` (no history) yields null.
+      3. Scale-only: signal / profile-vol.
+
+    In both modes bins with a degenerate (≈0) profile vol yield null and are dropped downstream.
     """
     df = df_signals.sort(['security', 'date', 'bin_start_time'])
-
-    # 1. Local centred intraday vol per signal, never crossing a day boundary.
-    df = df.with_columns([
-        pl.col(c)
-        .rolling_std(window_size=vol_win, min_samples=min_samples, center=True)
-        .over(SESSION)
-        .alias(f'_locvol_{c}')
-        for c in signal_cols
-    ])
-
-    # 2. Expanding mean of local vol over prior rolls within each (qcode, stage) cell. Each
-    # security appears once per stage and rolls have distinct target_dates, so the cumulative
-    # sum/count ordered by target_date (current row excluded) is exactly the past-rolls mean.
     stage = [qcode_col, 'days_until', 'bin_start_time']
-    df = df.sort([*stage, 'target_date', 'security'])
-    tor_exprs = []
-    for c in signal_cols:
-        lv = pl.col(f'_locvol_{c}')
-        present = lv.is_not_null().cast(pl.Int64)
-        prior_sum = lv.fill_null(0).cum_sum().over(stage) - lv.fill_null(0)
-        prior_cnt = present.cum_sum().over(stage) - present
-        # Guard prior_cnt == 0 explicitly: 0/0 would yield NaN (not null), which then slips
-        # past the > 1e-12 scale guard below. No prior roll -> no profile -> null.
-        tor_exprs.append(
-            pl.when(prior_cnt > 0).then(prior_sum / prior_cnt).otherwise(None).alias(f'_torvol_{c}')
+
+    if train_end is not None:
+        train_df = df.filter(pl.col('target_date').cast(pl.Date) <= pl.lit(train_end))
+
+        # Step 1. Intraday volatility per session: std of each signal across all bins within
+        # each (qcode, days_until, security, date) session.  Each day is the window.
+        # std() returns null for single-bin sessions; those are excluded from the mean below.
+        session_vol = (
+            train_df
+            .group_by([qcode_col, 'days_until', 'security', 'date'])
+            .agg([pl.col(c).std().alias(f'_sess_std_{c}') for c in signal_cols])
         )
-    df = df.with_columns(tor_exprs)
 
-    # 3. Scale-normalise; guard against a degenerate (≈0) profile vol producing inf.
-    df = df.with_columns([
-        pl.when(pl.col(f'_torvol_{c}') > 1e-12)
-        .then(pl.col(c) / pl.col(f'_torvol_{c}'))
-        .otherwise(None)
-        .alias(c)
-        for c in signal_cols
-    ])
+        # Step 2. Mean of that intraday vol per (qcode, days_until) across all train sessions.
+        profile = (
+            session_vol
+            .group_by([qcode_col, 'days_until'])
+            .agg([pl.col(f'_sess_std_{c}').mean().alias(f'_torstd_{c}') for c in signal_cols])
+        )
 
-    drop = [f'_locvol_{c}' for c in signal_cols] + [f'_torvol_{c}' for c in signal_cols]
-    return df.drop(drop).sort(['security', 'date', 'bin_start_time'])
+        df = df.join(profile, on=[qcode_col, 'days_until'], how='left')
+
+        # Step 3. Scale by mean intraday volatility.
+        df = df.with_columns([
+            pl.when(pl.col(f'_torstd_{c}') > 1e-12)
+            .then(pl.col(c) / pl.col(f'_torstd_{c}'))
+            .otherwise(None)
+            .alias(c)
+            for c in signal_cols
+        ])
+        drop_cols = [f'_torstd_{c}' for c in signal_cols]
+
+    else:
+        # Expanding mode: within-session local vol + expanding mean over prior rolls.
+        df = df.with_columns([
+            pl.col(c)
+            .rolling_std(window_size=vol_win, min_samples=min_samples, center=True)
+            .over(SESSION)
+            .alias(f'_locvol_{c}')
+            for c in signal_cols
+        ])
+
+        df = df.sort([*stage, 'target_date', 'security'])
+        tor_exprs = []
+        for c in signal_cols:
+            lv = pl.col(f'_locvol_{c}')
+            present = lv.is_not_null().cast(pl.Int64)
+            prior_sum = lv.fill_null(0).cum_sum().over(stage) - lv.fill_null(0)
+            prior_cnt = present.cum_sum().over(stage) - present
+            # Guard prior_cnt == 0: 0/0 yields NaN (not null), slipping past the > 1e-12 guard.
+            tor_exprs.append(
+                pl.when(prior_cnt > 0).then(prior_sum / prior_cnt).otherwise(None).alias(f'_torvol_{c}')
+            )
+        df = df.with_columns(tor_exprs)
+
+        df = df.with_columns([
+            pl.when(pl.col(f'_torvol_{c}') > 1e-12)
+            .then(pl.col(c) / pl.col(f'_torvol_{c}'))
+            .otherwise(None)
+            .alias(c)
+            for c in signal_cols
+        ])
+        drop_cols = [f'_locvol_{c}' for c in signal_cols] + [f'_torvol_{c}' for c in signal_cols]
+
+    return df.drop(drop_cols).sort(['security', 'date', 'bin_start_time'])
 
 
 def generate_signals(
     df_cs: pl.DataFrame,
     df_fut: pl.DataFrame | None = None,
     obi_method: str = "end_of_bin",
+    train_end: date | None = None,
 ) -> pl.DataFrame:
     """Microstructure signals (partitioned by SESSION [security, date]) + time-of-roll normalisation.
 
@@ -440,15 +480,26 @@ def generate_signals(
 
       1. delta_p in ticks (per-BBG_CODE tick size, kept as `_tick`),
       2. OBI as fraction of total quoted size at the touch (denominator set by `obi_method`),
-      3-5. OFI / STV / NOI divided by a volatility profiled by roll stage from prior rolls only
-           (see ``_normalize_time_of_roll``); requires `qcode`, `days_until`, `target_date`.
+      3-5. OFI / STV / NOI divided by a TOR volatility profile (see ``_normalize_time_of_roll``);
+           requires `qcode`, `days_until`, `target_date`.
+
+    Pass ``train_end`` to use the full-train-set profile (recommended); leave ``None`` for the
+    original expanding (prior-rolls-only) mode.  Use ``TRAIN_END`` for the standard 2021-23
+    static split, or ``w.train_end`` inside a walk-forward loop.
     """
-    return _normalize_time_of_roll(_apply_signal_transforms(df_cs, df_fut=df_fut, obi_method=obi_method))
+    return _normalize_time_of_roll(
+        _apply_signal_transforms(df_cs, df_fut=df_fut, obi_method=obi_method),
+        train_end=train_end,
+    )
 
 
 # ── 6. Outright-futures signals + buy/sell-leg augmentation ─────────────────────
 
-def generate_futures_signals(df: pl.DataFrame, obi_method: str = "end_of_bin") -> pl.DataFrame:
+def generate_futures_signals(
+    df: pl.DataFrame,
+    obi_method: str = "end_of_bin",
+    train_end: date | None = None,
+) -> pl.DataFrame:
     """Compute the normalised OBI / STV signals for the OUTRIGHT FUTURES.
 
     `df` may be the standalone futures frame (`df_fut`) or the combined frame (`df_combined`);
@@ -462,7 +513,7 @@ def generate_futures_signals(df: pl.DataFrame, obi_method: str = "end_of_bin") -
     df_fut = df_fut.with_columns(
         days_until=pl.business_day_count(pl.col('date'), pl.col('target_date')),
     )
-    return generate_signals(df_fut, obi_method=obi_method)
+    return generate_signals(df_fut, obi_method=obi_method, train_end=train_end)
 
 
 def attach_outright_signals(
@@ -518,6 +569,7 @@ def attach_leg_signals(
     df_combined: pl.DataFrame,
     signal_cols: tuple[str, ...] = ('obi', 'stv'),
     obi_method: str = "end_of_bin",
+    train_end: date | None = None,
 ) -> pl.DataFrame:
     """Add the buy-/sell-leg outright `signal_cols` to an already-built spread-signals frame.
 
@@ -527,7 +579,9 @@ def attach_leg_signals(
     rows whose leg is outside its roll window get null leg signals.
     """
     return attach_outright_signals(
-        df_signals, generate_futures_signals(df_combined, obi_method=obi_method), signal_cols=signal_cols,
+        df_signals,
+        generate_futures_signals(df_combined, obi_method=obi_method, train_end=train_end),
+        signal_cols=signal_cols,
     )
 
 

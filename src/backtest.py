@@ -68,6 +68,7 @@ from src.ordered_logit import (
     split_tick_constrained,
     clean_delta_p_tc,
 )
+from src.pipeline import _apply_signal_transforms, _normalize_time_of_roll
 
 # ── Configuration ────────────────────────────────────────────────────────────────
 
@@ -277,7 +278,7 @@ def historical_roll_volume(
 # ── 3. Walk-forward driver ──────────────────────────────────────────────────────────
 
 def run_rolling_backtest(
-    df_signals_tc_clean: pl.DataFrame,
+    df_tc_clean: pl.DataFrame,
     windows: list[RollingWindow],
     target_col: str = 'delta_p_fwd',
     feature_cols: list[str] = TC_FEATURES,
@@ -288,11 +289,15 @@ def run_rolling_backtest(
 ) -> pl.DataFrame:
     """Run the predictive ordered logit walk-forward across `windows` and collect OOS metrics.
 
-    For each window: fit on train, tune the -2 and +2 thresholds INDEPENDENTLY on val (each
-    maximising its tail's F-beta — see ``tune_thresholds`` / ``beta``), then score test at those
-    thresholds. Windows whose train/test slices are too small (early history may lack
-    tick-constrained data) are skipped with a logged reason rather than erroring, so the whole
-    walk-forward never aborts on a thin window.
+    ``df_tc_clean`` must be the output of ``_apply_signal_transforms`` → ``split_tick_constrained``
+    → ``clean_delta_p_tc``, i.e. *before* TOR normalisation.  TOR normalisation is applied per
+    window using the full train set (``train_end=w.train_end``) so the profile uses all train
+    rolls rather than only prior rolls, eliminating cold-start nulls.
+
+    For each window: normalise signals, fit on train, tune the -2 and +2 thresholds INDEPENDENTLY
+    on val (each maximising its tail's F-beta — see ``tune_thresholds`` / ``beta``), then score
+    test at those thresholds.  Windows whose train/test slices are too small are skipped with a
+    logged reason rather than erroring.
 
     Returns one row per attempted window: the window bounds, fitted class weight, the two tuned
     tail thresholds, per-tail validation F-beta, and test accuracy / macro-F-beta / per-class
@@ -304,9 +309,13 @@ def run_rolling_backtest(
     rows = []
     for w in windows:
         rec: dict = {**asdict(w), 'label': w.label()}
+
+        # TOR-normalise using all train rolls for this window (leakage within train is acceptable).
+        df_signals = _normalize_time_of_roll(df_tc_clean, train_end=w.train_end)
+
         try:
             res, data, class_weight = fit_ordered_logit(
-                df_signals_tc_clean,
+                df_signals,
                 train=(w.train_start, w.train_end),
                 val=(w.val_start, w.val_end),
                 test=(w.test_start, w.test_end),
@@ -368,7 +377,7 @@ def run_rolling_backtest(
 # ── 4. Per-bin OOS predictions (for the VWAP overlay) ───────────────────────────────
 
 def predict_target_bins(
-    df_signals_tc_clean: pl.DataFrame,
+    df_tc_clean: pl.DataFrame,
     windows: list[RollingWindow],
     target_col: str = 'delta_p_fwd',
     feature_cols: list[str] = TC_FEATURES,
@@ -378,6 +387,10 @@ def predict_target_bins(
     verbose: bool = True,
 ) -> pl.DataFrame | None:
     """Walk-forward OOS predictions aligned to each bin.
+
+    ``df_tc_clean`` must be the pre-TOR-norm signals (output of ``_apply_signal_transforms`` →
+    ``split_tick_constrained`` → ``clean_delta_p_tc``).  TOR normalisation is applied per window
+    with ``train_end=w.train_end`` so the profile uses all train rolls.
 
     For each window: fit on train, tune the threshold on val, then predict ``delta_p_fwd`` for
     every test bin with non-null features. Because ``delta_p_fwd`` is already forward-shifted,
@@ -391,9 +404,12 @@ def predict_target_bins(
     """
     out = []
     for w in windows:
+        # TOR-normalise using all train rolls for this window.
+        df_signals = _normalize_time_of_roll(df_tc_clean, train_end=w.train_end)
+
         try:
             res, data, _ = fit_ordered_logit(
-                df_signals_tc_clean,
+                df_signals,
                 train=(w.train_start, w.train_end),
                 val=(w.val_start, w.val_end),
                 test=(w.test_start, w.test_end),
@@ -416,7 +432,7 @@ def predict_target_bins(
         # target, so the last bin of each session is still scored), keeping the row keys.
         # 1. Keep the full continuous timeline intact first
         test_full = (
-            df_signals_tc_clean
+            df_signals
             .filter(pl.col('date').is_between(pl.lit(w.test_start), pl.lit(w.test_end), closed='both'))
             .select(['security', 'date', 'bin_start_time', *feature_cols])
             .sort(['security', 'date', 'bin_start_time'])
@@ -462,30 +478,35 @@ def build_backtest_inputs(
     data_end_year: int = 2025,
     session=None,
 ):
-    """Convenience wiring: pull the full history, generate signals, clean the tick-constrained
-    target, and build both the walk-forward windows and per-``qcode`` volume curves.
+    """Convenience wiring: pull the full history, produce pre-TOR-norm signals, clean the
+    tick-constrained target, and build both the walk-forward windows and per-``qcode`` volume curves.
 
-    Returns ``(df_signals_tc_clean, volume_curves, windows)``. Requires a live Snowflake
-    connection; the regression/volume utilities above are usable standalone on any cached
-    ``df_cs`` / ``df_signals`` without calling this.
+    Returns ``(df_tc_clean, volume_curves, windows)`` where ``df_tc_clean`` is the output of
+    ``_apply_signal_transforms`` → ``split_tick_constrained`` → ``clean_delta_p_tc``, i.e.
+    *before* TOR normalisation.  Pass it directly to ``run_rolling_backtest`` or
+    ``predict_target_bins``; TOR normalisation is applied per window inside those functions
+    using the window's own ``train_end``.
+
+    Requires a live Snowflake connection; the regression/volume utilities above are usable
+    standalone on any cached ``df_cs`` / ``df_tc_clean`` without calling this.
     """
-    from src.pipeline import build_datasets, generate_signals
+    from src.pipeline import build_datasets
 
     years = list(range(data_start_year, data_end_year + 1))
     df_cs, _ = build_datasets(env_path=env_path, session=session, years=years)
-    # 'time_of_roll' normalisation profiles each signal's volatility from PRIOR rolls only, so
-    # it needs no `train_years` and leaks nothing across the walk-forward splits.
-    df_signals = generate_signals(df_cs, normalization='time_of_roll')
 
-    _, df_signals_tc = split_tick_constrained(df_signals)
-    df_signals_tc_clean = clean_delta_p_tc(df_signals_tc)
+    # Compute microstructure signals and scale transforms; TOR normalisation is deferred to
+    # each walk-forward window so the profile uses only that window's train rolls.
+    df_transformed = _apply_signal_transforms(df_cs)
+    _, df_transformed_tc = split_tick_constrained(df_transformed)
+    df_tc_clean = clean_delta_p_tc(df_transformed_tc)
 
     volume_curves = compute_volume_curve(df_cs)
 
     data_end = df_cs['date'].max()
     windows = generate_rolling_windows(data_end=data_end, data_start=date(data_start_year, 1, 1))
 
-    return df_signals_tc_clean, volume_curves, windows
+    return df_tc_clean, volume_curves, windows
 
 
 if __name__ == '__main__':
