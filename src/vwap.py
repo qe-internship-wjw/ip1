@@ -75,7 +75,7 @@ def attach_volume_schedule(
     roll_bins: pl.DataFrame,
     curve: pl.DataFrame,
     roll_volume: pl.DataFrame,
-    participation_rate: float = 0.05,
+    participation_rate: float = 0.01,
     qcode_col: str = 'qcode',
     position_cols: tuple[str, ...] = ('days_until', 'bin_start_time'),
 ) -> pl.DataFrame:
@@ -333,7 +333,7 @@ def summarize(sim: pl.DataFrame, direction: str = 'buy') -> dict:
 def build_schedules(
     df_bins: pl.DataFrame,
     df_history: pl.DataFrame,
-    participation_rate: float = 0.05,
+    participation_rate: float = 0.01,
     leakage_safe: bool = True,
     curve: pl.DataFrame | None = None,
     roll_volume: pl.DataFrame | None = None,
@@ -377,7 +377,7 @@ def build_schedules(
 
 def run_vwap_backtest(
     df_cs: pl.DataFrame,
-    participation_rate: float = 0.05,
+    participation_rate: float = 0.01,
     direction: str = 'buy',
     fill_model: str = 'queue',
     window_fraction: float = 0.3,
@@ -580,7 +580,7 @@ def run_improved_vwap_backtest(
     df_cs: pl.DataFrame,
     predictions: pl.DataFrame,
     df_signals: pl.DataFrame,
-    participation_rate: float = 0.05,
+    participation_rate: float = 0.01,
     direction: str = 'buy',
     fill_model: str = 'hilo',
     ticks: int = 2,
