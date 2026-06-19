@@ -63,7 +63,7 @@ from src.backtest import (
 )
 # The stateful limit-order-book / queue matching engine lives in its own module; re-exported here
 # so existing ``from src.vwap import simulate_windowed`` call sites keep working.
-from src.lob_simulation import simulate_windowed
+from src.lob_simulation import simulate_windowed, compute_survival_window
 
 # Columns the simulator reads off each bin (besides the schedule).
 _PRICE_COLS = ['bid_start', 'ask_start', 'bid_size_start', 'ask_size_start', 'volume', 'signed_volume']
@@ -202,7 +202,8 @@ def _cost_columns(df: pl.DataFrame, side: int) -> pl.DataFrame:
 
     Each baseline (mid, market VWAP, arrival) gets a cost in both units. Costs are signed so
     positive = unfavourable for either direction. Tick columns are emitted only when `avg_tick`
-    is present (i.e. a `tick` column reached the aggregation)."""
+    is present (i.e. a `tick` column reached the aggregation); bp columns only when `avg_futures`
+    is present (a `futures_price` column reached the aggregation — see ``attach_futures_price``)."""
     df = df.with_columns(
         total_qty=pl.col('passive_qty') + pl.col('agg_qty'),
     ).with_columns(
@@ -216,12 +217,14 @@ def _cost_columns(df: pl.DataFrame, side: int) -> pl.DataFrame:
         cost_vs_arrival=side * (pl.col('exec_avg_price') - pl.col('arrival_mid')),
     )
 
-    exprs = [
-        (pl.col('cost_vs_mid') * 1e4 / pl.col('avg_futures')).alias('cost_vs_mid_bp'),
-        (pl.col('cost_vs_vwap') * 1e4 / pl.col('avg_futures')).alias('cost_vs_vwap_bp'),
-        (pl.col('cost_vs_arrival') * 1e4 / pl.col('avg_futures')).alias('cost_vs_arrival_bp'),
-        (pl.col('avg_half_spread') * 1e4 / pl.col('avg_futures')).alias('half_spread_bp'),
-    ]
+    exprs = []
+    if 'avg_futures' in df.columns:
+        exprs += [
+            (pl.col('cost_vs_mid') * 1e4 / pl.col('avg_futures')).alias('cost_vs_mid_bp'),
+            (pl.col('cost_vs_vwap') * 1e4 / pl.col('avg_futures')).alias('cost_vs_vwap_bp'),
+            (pl.col('cost_vs_arrival') * 1e4 / pl.col('avg_futures')).alias('cost_vs_arrival_bp'),
+            (pl.col('avg_half_spread') * 1e4 / pl.col('avg_futures')).alias('half_spread_bp'),
+        ]
     if 'avg_tick' in df.columns:
         exprs += [
             (pl.col('cost_vs_mid') / pl.col('avg_tick')).alias('cost_vs_mid_ticks'),
@@ -243,7 +246,6 @@ _AGG_EXPRS = [
     (pl.col('mid') * pl.col('volume')).sum().alias('mkt_vwap_num'),
     pl.col('volume').sum().alias('mkt_vol'),
     pl.col('mid').first().alias('arrival_mid'),
-    pl.col('futures_price').mean().alias('avg_futures'),
     ((pl.col('ask_start') - pl.col('bid_start')) / 2).mean().alias('avg_half_spread'),
     pl.len().alias('n_bins'),
 ]
@@ -256,6 +258,8 @@ def per_security_metrics(sim: pl.DataFrame, direction: str = 'buy') -> pl.DataFr
     benchmarks in BOTH ticks per lot (default) and bp of the future price. Tick costs require a
     `tick` column on `sim` (e.g. via ``attach_tick_sizes``)."""
     aggs = list(_AGG_EXPRS)
+    if 'futures_price' in sim.columns:
+        aggs.append(pl.col('futures_price').mean().alias('avg_futures'))
     if 'tick' in sim.columns:
         aggs.append(pl.col('tick').mean().alias('avg_tick'))
     g = sim.group_by('security', maintain_order=True).agg(aggs).filter(pl.col('scheduled_qty') > 0)
@@ -295,11 +299,19 @@ def summarize(sim: pl.DataFrame, direction: str = 'buy') -> dict:
     # Core normalized benchmarks and costs
     lot_weighted_cols = [
         'passive_rate', 'exec_avg_price', 'mid_benchmark', 'mkt_vwap', 'arrival_mid',
-        'avg_futures', 'avg_half_spread', 'cost_vs_mid', 'cost_vs_vwap', 'cost_vs_arrival',
-        'cost_vs_mid_bp', 'cost_vs_vwap_bp', 'cost_vs_arrival_bp', 'half_spread_bp'
+        'avg_half_spread', 'cost_vs_mid', 'cost_vs_vwap', 'cost_vs_arrival',
     ]
     for c in lot_weighted_cols:
         selects.append(lot_weighted(c))
+
+    # Conditional basis-point framework columns (only when a futures price was available)
+    if 'avg_futures' in ps.columns:
+        bp_cols = [
+            'avg_futures', 'cost_vs_mid_bp', 'cost_vs_vwap_bp',
+            'cost_vs_arrival_bp', 'half_spread_bp'
+        ]
+        for c in bp_cols:
+            selects.append(lot_weighted(c))
 
     # Conditional tick framework columns
     if 'avg_tick' in ps.columns:
@@ -380,17 +392,20 @@ def run_vwap_backtest(
     """Run the baseline VWAP over every roll in `df_cs` and return (per-security metrics, summary).
 
     `df_cs` is the spread frame from ``pipeline.build_datasets`` (one row per bin, carrying
-    `qcode`, `security`, `days_until`, `target_date`, the *_start quotes, volume / signed_volume,
-    and `futures_price`). See ``build_schedules`` for the `leakage_safe` curve semantics.
+    `qcode`, `security`, `days_until`, `target_date`, the *_start quotes and volume /
+    signed_volume). See ``build_schedules`` for the `leakage_safe` curve semantics.
 
     `participation_rate` sizes each roll as that fraction of its qcode's average roll volume.
     `window_fraction` sets the per-security order survival window to that fraction of the
     security's touch-size-to-trade-volume ratio (see ``lob_simulation.simulate_windowed``); a
     larger window lets a passive order rest across more bins, raising the passive-fill rate. Pass
-    `df_signals` (carrying `_tick`) to also report costs in ticks per lot (the default framework).
+    `df_signals` to report costs in ticks per lot (the default framework, from its `_tick`) and,
+    when it carries a non-null `futures_price` (i.e. ``generate_signals`` was given a `df_fut`), in
+    basis points too; without it only the ticks framework is emitted.
     """
     if df_signals is not None:
-        df_cs = attach_tick_sizes(df_cs, df_signals)
+        df_cs = attach_tick_sizes(df_cs, df_signals)       # adds `tick`  -> ticks framework
+        df_cs = attach_futures_price(df_cs, df_signals)    # adds `futures_price` -> bp framework
     scheduled = build_schedules(
         df_cs, df_cs, participation_rate, leakage_safe, curve, roll_volume,
         qcode_col, position_cols, target_col,
@@ -408,6 +423,26 @@ def attach_tick_sizes(df_cs: pl.DataFrame, df_signals: pl.DataFrame, tick_col: s
     return df_cs.join(ticks, on='bbg_code', how='left')
 
 
+def attach_futures_price(df_cs: pl.DataFrame, df_signals: pl.DataFrame) -> pl.DataFrame:
+    """Join the per-bin near-leg ``futures_price`` from ``generate_signals`` output onto `df_cs`,
+    enabling the basis-point cost framework in ``per_security_metrics`` / ``summarize``.
+
+    ``build_datasets``' `df_cs` no longer carries `futures_price` — it is computed in
+    ``generate_signals`` (only when a `df_fut` is supplied). This brings it back onto the bins via
+    the same `df_signals` conduit ``attach_tick_sizes`` uses. A no-op if `df_signals` lacks the
+    column, `df_cs` already has it, or the column is entirely null (``generate_signals`` was run
+    without a `df_fut`, so there is no real futures price) — in which case the bp framework is
+    simply not emitted and only the ticks framework is reported."""
+    if (
+        'futures_price' not in df_signals.columns
+        or 'futures_price' in df_cs.columns
+        or df_signals['futures_price'].null_count() == df_signals.height
+    ):
+        return df_cs
+    keys = ['security', 'date', 'bin_start_time']
+    return df_cs.join(df_signals.select([*keys, 'futures_price']), on=keys, how='left')
+
+
 def simulate_improved_vwap(
     scheduled: pl.DataFrame,
     direction: str = 'buy',
@@ -416,6 +451,7 @@ def simulate_improved_vwap(
     pred_col: str = 'pred',
     ticks: int = 2,
     queue_depth_levels: float = 1.7,
+    overlay_actions: str = 'both',
     high_col: str = 'high',
     low_col: str = 'low',
 ) -> pl.DataFrame:
@@ -433,6 +469,10 @@ def simulate_improved_vwap(
     Selling mirrors this (favourable = +2 -> rest `ticks` above the ask; adverse = -2 -> cross now).
     The session's last bin is still forced aggressive (overnight guard), as in the baseline.
 
+    `overlay_actions` enables only one of the two actions for studying each in isolation: 'both'
+    (default), 'favourable' (rest-deeper only — adverse calls fall back to the baseline touch), or
+    'adverse' (cross-now only — favourable calls fall back to the baseline touch).
+
     Fill of the deeper passive level is genuinely uncertain with only top-of-book depth, so:
       - `fill_model='hilo'` (default, recommended): the limit fills in full iff the bin's range
         reaches it (``low <= bid - ticks*tick`` for a buy) — the most defensible call from the
@@ -447,6 +487,10 @@ def simulate_improved_vwap(
         raise ValueError(f"direction must be 'buy' or 'sell', got {direction!r}")
     if fill_model not in ('queue', 'hilo'):
         raise ValueError(f"fill_model must be 'queue' or 'hilo', got {fill_model!r}")
+    if overlay_actions not in ('both', 'favourable', 'adverse'):
+        raise ValueError(
+            f"overlay_actions must be 'both', 'favourable' or 'adverse', got {overlay_actions!r}"
+        )
     has_range = high_col in scheduled.columns and low_col in scheduled.columns
     if fill_model == 'hilo' and not has_range:
         raise ValueError(
@@ -498,8 +542,11 @@ def simulate_improved_vwap(
         deep_fill = pl.when(reach_deep).then((opposing - queue_depth_levels * depth).clip(lower_bound=0)).otherwise(0.0)
 
     pred = pl.col(pred_col)
-    force_agg = is_last | (pred == adverse)
-    is_fav = (pred == favourable) & ~is_last
+    # Partial overlay: drop the disabled action so those bins fall back to the baseline touch.
+    act_adverse = overlay_actions in ('both', 'adverse')
+    act_favourable = overlay_actions in ('both', 'favourable')
+    force_agg = is_last | ((pred == adverse) if act_adverse else pl.lit(False))
+    is_fav = ((pred == favourable) & ~is_last) if act_favourable else pl.lit(False)
 
     passive_price = pl.when(is_fav).then(deep_level).otherwise(touch)
     passive_fill = (
@@ -540,6 +587,7 @@ def run_improved_vwap_backtest(
     window_fraction: float = 0.3,
     leakage_safe: bool = True,
     framework: str = 'ticks',
+    overlay_actions: str = 'both',
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Compare the ordered-logit VWAP to the baseline on the SAME rolls and schedule.
 
@@ -553,6 +601,11 @@ def run_improved_vwap_backtest(
     The headline `improvement_vs_baseline` / `improvement_vs_vwap` columns are in that unit
     (positive = overlay cheaper); per-strategy cost columns are reported in BOTH units so the
     other framework is always one subtraction away.
+
+    `overlay_actions` selects which overlay action the compared strategy uses — 'both' (default,
+    the full overlay), 'favourable' (rest-deeper only), or 'adverse' (cross-now only) — so the two
+    modifications can be evaluated in isolation against the same baseline (see
+    ``lob_simulation.simulate_windowed``).
 
     `participation_rate` sizes each roll as that fraction of its qcode's average roll volume.
     `window_fraction` sets each security's order survival window to that fraction of its
@@ -576,7 +629,8 @@ def run_improved_vwap_backtest(
     secs = predictions.select('security').unique()
     df_use = (
         df_cs.join(secs, on='security', how='inner')
-        .pipe(attach_tick_sizes, df_signals)   # adds `tick` -> enables the ticks framework
+        .pipe(attach_tick_sizes, df_signals)      # adds `tick` -> enables the ticks framework
+        .pipe(attach_futures_price, df_signals)   # adds `futures_price` -> enables the bp framework
         .join(
             predictions.select('security', 'date', 'bin_start_time', 'pred'),
             on=['security', 'date', 'bin_start_time'], how='left',
@@ -588,7 +642,8 @@ def run_improved_vwap_backtest(
     base_sim = simulate_windowed(scheduled, direction=direction, fill_model=fill_model,
                                  window_fraction=window_fraction)
     impr_sim = simulate_windowed(scheduled, direction=direction, fill_model=fill_model,
-                                 window_fraction=window_fraction, ticks=ticks, pred_col='pred')
+                                 window_fraction=window_fraction, ticks=ticks, pred_col='pred',
+                                 overlay_actions=overlay_actions)
 
     base_sum = {'strategy': 'baseline_vwap', **summarize(base_sim, direction)}
     impr_sum = {'strategy': 'ordered_logit_vwap', **summarize(impr_sim, direction)}
@@ -600,11 +655,14 @@ def run_improved_vwap_backtest(
         framework=pl.lit(framework),
     )
 
-    cost_cols = ['cost_vs_vwap_ticks', 'cost_vs_vwap_bp', 'cost_vs_mid_ticks', 'cost_vs_mid_bp']
     # `total_qty` (lots executed per roll, = the roll's participation-rate target by conservation)
     # is the correct per-lot weight for aggregating per-roll improvement across rolls — it is what
     # `summarize` pools over. With a participation rate this varies by roll (larger rolls weigh more).
-    base_ps = per_security_metrics(base_sim, direction).select(
+    base_full = per_security_metrics(base_sim, direction)
+    # bp cost columns only exist when a futures price was available (see `per_security_metrics`).
+    cost_cols = [c for c in ('cost_vs_vwap_ticks', 'cost_vs_vwap_bp', 'cost_vs_mid_ticks',
+                             'cost_vs_mid_bp') if c in base_full.columns]
+    base_ps = base_full.select(
         'security', 'qcode', 'total_qty', 'passive_rate', 'exec_avg_price', *cost_cols,
     )
     impr_ps = per_security_metrics(impr_sim, direction).select(

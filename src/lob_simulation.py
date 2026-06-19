@@ -24,6 +24,42 @@ import polars as pl
 
 # ── Multi-bin survival windows (stateful order book) ───────────────────────────────
 
+def compute_survival_window(
+    df: pl.DataFrame,
+    window_fraction: float = 0.3,
+    direction: str = 'buy',
+    group_col: str = 'security',
+) -> pl.DataFrame:
+    """Per-group order survival window, sized from the group's own queue dynamics.
+
+    The touch-size-to-trade-volume ratio (mean resting depth on OUR side / mean bin trade volume)
+    estimates queue time — how many bins of opposing flow are needed to clear the depth ahead. The
+    window is `window_fraction` of that ratio, rounded and floored at 1 bin:
+
+        W = max(1, round(window_fraction * mean(touch_size) / mean(volume)))
+
+    The touch side follows `direction` (the bid for a buy, the ask for a sell). A group with no
+    traded volume falls back to a single-bin window. ``simulate_windowed`` calls this with
+    ``group_col='security'`` (the per-security window it simulates); pass ``group_col='qcode'`` to
+    inspect the window at the qcode level. Returns one row per group with `avg_touch_size`,
+    `avg_volume` and the integer `window`.
+    """
+    if direction not in ('buy', 'sell'):
+        raise ValueError(f"direction must be 'buy' or 'sell', got {direction!r}")
+    touch = 'bid_size_start' if direction == 'buy' else 'ask_size_start'
+    return (
+        df.group_by(group_col, maintain_order=True)
+        .agg(avg_touch_size=pl.col(touch).mean(), avg_volume=pl.col('volume').mean())
+        .with_columns(
+            window=pl.when(pl.col('avg_volume') > 0)
+            .then((window_fraction * pl.col('avg_touch_size') / pl.col('avg_volume')).round())
+            .otherwise(1.0)
+            .clip(lower_bound=1.0)
+            .cast(pl.Int64)
+        )
+    )
+
+
 def _sim_session(sched, opp, tp, ts, cp, deep, ext, pred,
                  W, queue_model, qdepth, favourable, adverse, is_buy, has_range):
     """Simulate one [security, date] session with `W`-bin survival windows.
@@ -201,6 +237,7 @@ def simulate_windowed(
     ticks: int = 2,
     queue_depth_levels: float = 0.7,
     pred_col: str | None = None,
+    overlay_actions: str = 'both',
     high_col: str = 'high',
     low_col: str = 'low',
 ) -> pl.DataFrame:
@@ -234,6 +271,16 @@ def simulate_windowed(
     crossed immediately. A small enough `window_fraction` (single-bin windows) + `pred_col`
     reproduces the single-bin overlay.
 
+    `overlay_actions` selects WHICH of the two overlay actions is enabled, for studying each in
+    isolation (only meaningful when `pred_col` is set):
+      - 'both'        (default): both actions — the full overlay (current behaviour).
+      - 'favourable'  : act only on favourable calls (rest deeper); adverse calls are neutralised
+                        so those bins execute exactly like the baseline (rest at the touch).
+      - 'adverse'     : act only on adverse calls (cross immediately); favourable calls are
+                        neutralised so those bins rest at the touch like the baseline.
+    Each partial overlay is realised by zeroing the predictions of the disabled action, so the
+    unaffected bins are bit-for-bit identical to the baseline.
+
     Emits the per-bin columns ``passive_fill / passive_price / agg_qty / agg_price`` (attributed
     to each order's owner bin) plus ``mid``, so the metric helpers consume it unchanged. Two
     further columns ``passive_traded / agg_traded`` give the same fills/crosses attributed to the
@@ -245,6 +292,10 @@ def simulate_windowed(
         raise ValueError(f"fill_model must be 'queue' or 'hilo', got {fill_model!r}")
     if window_fraction <= 0:
         raise ValueError(f"window_fraction must be positive, got {window_fraction!r}")
+    if overlay_actions not in ('both', 'favourable', 'adverse'):
+        raise ValueError(
+            f"overlay_actions must be 'both', 'favourable' or 'adverse', got {overlay_actions!r}"
+        )
     overlay = pred_col is not None and pred_col in scheduled.columns
     has_range = high_col in scheduled.columns and low_col in scheduled.columns
     if fill_model == 'hilo' and not has_range:
@@ -281,22 +332,20 @@ def simulate_windowed(
         _pred=pl.col(pred_col).fill_null(0).cast(pl.Int64) if overlay else pl.lit(0, dtype=pl.Int64),
     )
 
-    # Per-security survival window: window_fraction * (mean touch size / mean trade volume),
-    # rounded and floored at 1 bin. `_ts` is the resting depth on OUR side (bid for a buy, ask
-    # for a sell); `volume` is the bin's trade volume. A security with no traded volume falls
-    # back to a single-bin window.
-    win = (
-        df.group_by('security', maintain_order=True)
-        .agg(_avg_ts=pl.col('_ts').mean(), _avg_vol=pl.col('volume').mean())
-        .with_columns(
-            _window=pl.when(pl.col('_avg_vol') > 0)
-            .then((window_fraction * pl.col('_avg_ts') / pl.col('_avg_vol')).round())
-            .otherwise(1.0)
-            .clip(lower_bound=1.0)
-            .cast(pl.Int64)
+    # Partial overlay: neutralise the disabled action's predictions to 0 so those bins fall back to
+    # the baseline (rest at the touch). 'favourable' keeps only favourable calls, 'adverse' only
+    # adverse calls; 'both' leaves `_pred` untouched.
+    if overlay and overlay_actions != 'both':
+        drop_class = adverse if overlay_actions == 'favourable' else favourable
+        df = df.with_columns(
+            _pred=pl.when(pl.col('_pred') == drop_class).then(0).otherwise(pl.col('_pred'))
         )
-    )
-    window_by_sec = dict(zip(win['security'].to_list(), win['_window'].to_list()))
+
+    # Per-security survival window: window_fraction * (mean touch size / mean trade volume),
+    # rounded and floored at 1 bin (see ``compute_survival_window``). A security with no traded
+    # volume falls back to a single-bin window.
+    win = compute_survival_window(df, window_fraction, direction, 'security')
+    window_by_sec = dict(zip(win['security'].to_list(), win['window'].to_list()))
 
     arrs = ['scheduled_qty', '_opp', '_tp', '_ts', '_cp', '_deep', '_ext', '_pred']
     queue_model = fill_model == 'queue'
